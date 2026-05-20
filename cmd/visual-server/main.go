@@ -225,7 +225,7 @@ func main() {
 	mux.HandleFunc("/api/visual-sections", s.handleVisualSections)
 	mux.HandleFunc("/api/visual-sections/crawl", s.handleVisualSectionsCrawl)
 	mux.HandleFunc("/api/visual-sections/", s.handleVisualSection)
-	mux.Handle("/visual-results/", http.StripPrefix("/visual-results/", http.FileServer(http.Dir(filepath.Join(rootDir, "public", "visual-results")))))
+	mux.HandleFunc("/visual-results/", s.handleVisualResults)
 	mux.HandleFunc("/assets/baselines/", s.handleBaselineAsset)
 	mux.HandleFunc("/", s.handleStatic)
 
@@ -520,6 +520,58 @@ func (s server) handleVisualRevision(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, response)
+}
+
+func (s server) handleVisualResults(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeError(w, http.StatusMethodNotAllowed, "Only GET is supported.")
+		return
+	}
+
+	resultsRoot := filepath.Join(s.rootDir, "public", "visual-results")
+	relativePath := filepath.Clean(strings.TrimPrefix(r.URL.Path, "/visual-results/"))
+	if relativePath == "." {
+		http.NotFound(w, r)
+		return
+	}
+
+	resultPath := filepath.Join(resultsRoot, filepath.FromSlash(relativePath))
+	if isInside(resultsRoot, resultPath) {
+		if info, err := os.Stat(resultPath); err == nil && !info.IsDir() {
+			http.ServeFile(w, r, resultPath)
+			return
+		}
+	}
+
+	parts := strings.Split(filepath.ToSlash(relativePath), "/")
+	if len(parts) != 2 || !validProjectID(parts[0]) {
+		http.NotFound(w, r)
+		return
+	}
+
+	if _, err := s.projectByID(parts[0]); err != nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	switch parts[1] {
+	case "history.json":
+		writeJSON(w, http.StatusOK, visualHistory{
+			Version:   1,
+			Revisions: []revisionSummary{},
+		})
+	case "manifest.json":
+		writeJSON(w, http.StatusOK, revisionManifest{
+			Version:      1,
+			Status:       statusBaseline,
+			TotalPages:   0,
+			ChangedPages: 0,
+			CleanPages:   0,
+			Items:        []visualItem{},
+		})
+	default:
+		http.NotFound(w, r)
+	}
 }
 
 func (s server) handleBaselineAsset(w http.ResponseWriter, r *http.Request) {
