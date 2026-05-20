@@ -151,6 +151,10 @@ async function captureBaselines(page, pages, update) {
   await mkdir(snapshotDir, { recursive: true });
 
   for (const visualPage of pages) {
+    if (visualPage.manualBaseline) {
+      continue;
+    }
+
     const snapshotPath = path.join(snapshotDir, visualPage.baselineFileName);
     const shouldCapture = update || !(await fileExists(snapshotPath));
 
@@ -174,6 +178,7 @@ export async function crawlVisualBaselines(options = {}) {
   const targetUrl = options.targetUrl ?? defaultTargetUrl;
   const maxPages = options.maxPages ?? defaultMaxPages;
   const update = options.update ?? false;
+  const sectionId = options.sectionId ?? null;
   const existingManifest = await readExistingManifest();
   const browser = await chromium.launch();
 
@@ -183,8 +188,28 @@ export async function crawlVisualBaselines(options = {}) {
       deviceScaleFactor: 1,
     });
 
+    if (sectionId) {
+      const sectionPages = Array.isArray(existingManifest?.pages)
+        ? existingManifest.pages.filter((visualPage) => visualPage.id === sectionId)
+        : [];
+
+      if (sectionPages.length === 0) {
+        throw new Error(`Unknown visual section: ${sectionId}`);
+      }
+
+      await captureBaselines(page, sectionPages, update);
+      return existingManifest;
+    }
+
     const discoveredPages = await discoverPages(page, targetUrl, maxPages);
-    const manifestPages = discoveredPages.length > 0 ? discoveredPages : existingManifest?.pages ?? [];
+    const manualPages = Array.isArray(existingManifest?.pages)
+      ? existingManifest.pages.filter((manifestPage) => manifestPage.manualBaseline)
+      : [];
+    const discoveredIds = new Set(discoveredPages.map((visualPage) => visualPage.id));
+    const retainedManualPages = manualPages.filter((visualPage) => !discoveredIds.has(visualPage.id));
+    const manifestPages = discoveredPages.length > 0
+      ? [...discoveredPages, ...retainedManualPages]
+      : existingManifest?.pages ?? [];
 
     await captureBaselines(page, manifestPages, update);
 
@@ -206,6 +231,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   await crawlVisualBaselines({
     targetUrl: getArgValue('target', defaultTargetUrl),
     maxPages: Number(getArgValue('max-pages', String(defaultMaxPages))),
+    sectionId: getArgValue('section', null),
     update: hasArg('update'),
   });
 }

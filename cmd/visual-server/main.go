@@ -1,18 +1,23 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 type visualStatus string
@@ -23,6 +28,30 @@ const (
 	statusChanged  visualStatus = "changed"
 	statusAccepted visualStatus = "accepted"
 )
+
+const (
+	defaultTargetURL      = "https://visual-test-sample.vercel.app/"
+	maxBaselineUploadSize = 20 << 20
+)
+
+type visualPagesManifest struct {
+	Version     int          `json:"version"`
+	TargetURL   string       `json:"targetUrl"`
+	GeneratedAt string       `json:"generatedAt"`
+	Pages       []visualPage `json:"pages"`
+}
+
+type visualPage struct {
+	ID               string `json:"id"`
+	Name             string `json:"name"`
+	Path             string `json:"path"`
+	URL              string `json:"url"`
+	SnapshotName     string `json:"snapshotName"`
+	BaselineFileName string `json:"baselineFileName"`
+	BaselineImageURL string `json:"baselineImageUrl"`
+	SnapshotPath     string `json:"snapshotPath"`
+	ManualBaseline   bool   `json:"manualBaseline,omitempty"`
+}
 
 type visualItem struct {
 	ID               string       `json:"id"`
@@ -103,6 +132,12 @@ type scanResponse struct {
 	Manifest revisionManifest `json:"manifest"`
 }
 
+type sectionResponse struct {
+	Message  string           `json:"message"`
+	Section  visualItem       `json:"section"`
+	Manifest revisionManifest `json:"manifest"`
+}
+
 type server struct {
 	rootDir          string
 	staticDir        string
@@ -129,6 +164,8 @@ func main() {
 	mux.HandleFunc("/api/health", s.handleHealth)
 	mux.HandleFunc("/api/visual-scan", s.handleVisualScan)
 	mux.HandleFunc("/api/visual-revisions/", s.handleVisualRevision)
+	mux.HandleFunc("/api/visual-sections", s.handleVisualSections)
+	mux.HandleFunc("/api/visual-sections/", s.handleVisualSection)
 	mux.Handle("/visual-results/", http.StripPrefix("/visual-results/", http.FileServer(http.Dir(s.visualResultsDir))))
 	mux.Handle("/assets/baselines/visual-test-sample/", http.StripPrefix("/assets/baselines/visual-test-sample/", http.FileServer(http.Dir(s.snapshotDir))))
 	mux.HandleFunc("/", s.handleStatic)
@@ -161,17 +198,88 @@ func (s server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+func (s server) handleVisualSections(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		manifest, err := s.readVisualPagesManifest()
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "Could not read visual sections.")
+			return
+		}
+
+		writeJSON(w, http.StatusOK, s.visualPagesToManifest(manifest))
+	case http.MethodPost:
+		response, err := s.addVisualSection(w, r)
+		if err != nil {
+			log.Printf("add visual section failed: %v", err)
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		writeJSON(w, http.StatusOK, response)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "Only GET and POST are supported.")
+	}
+}
+
+func (s server) handleVisualSection(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "Only POST is supported.")
+		return
+	}
+
+	pathSuffix := strings.TrimPrefix(r.URL.Path, "/api/visual-sections/")
+	parts := strings.Split(strings.Trim(pathSuffix, "/"), "/")
+	if len(parts) != 2 || parts[0] == "" || strings.Contains(parts[0], "..") {
+		writeError(w, http.StatusBadRequest, "Use /api/visual-sections/{sectionID}/baseline or /api/visual-sections/{sectionID}/scan.")
+		return
+	}
+
+	switch parts[1] {
+	case "baseline":
+		response, err := s.updateVisualSectionBaseline(w, r, parts[0])
+		if err != nil {
+			log.Printf("update section baseline failed: %v", err)
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		writeJSON(w, http.StatusOK, response)
+	case "scan":
+		response, err := s.runVisualScan(r.Context(), parts[0])
+		if err != nil {
+			log.Printf("section visual scan failed: %v", err)
+			if errors.Is(err, errScanAlreadyRunning) {
+				writeError(w, http.StatusConflict, err.Error())
+				return
+			}
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		writeJSON(w, http.StatusOK, response)
+	default:
+		writeError(w, http.StatusBadRequest, "Use /api/visual-sections/{sectionID}/baseline or /api/visual-sections/{sectionID}/scan.")
+	}
+}
+
 func (s *server) handleVisualScan(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "Only POST is supported.")
 		return
 	}
 
-	response, err := s.runVisualScan()
+	response, err := s.runVisualScan(r.Context(), "")
 	if err != nil {
 		log.Printf("visual scan failed: %v", err)
 		if errors.Is(err, errScanAlreadyRunning) {
 			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		if errors.Is(err, context.Canceled) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -241,7 +349,7 @@ func (s server) handleStatic(w http.ResponseWriter, r *http.Request) {
 
 var errScanAlreadyRunning = errors.New("A visual scan is already running.")
 
-func (s *server) runVisualScan() (scanResponse, error) {
+func (s *server) runVisualScan(ctx context.Context, sectionID string) (scanResponse, error) {
 	s.scanMu.Lock()
 	if s.scanning {
 		s.scanMu.Unlock()
@@ -256,13 +364,22 @@ func (s *server) runVisualScan() (scanResponse, error) {
 		s.scanMu.Unlock()
 	}()
 
-	command := exec.Command("npm", "run", "test:visual")
+	commandArgs := []string{"run", "test:visual"}
+	if sectionID != "" {
+		commandArgs = append(commandArgs, "--", "--section="+sectionID)
+	}
+
+	command := exec.CommandContext(ctx, "npm", commandArgs...)
 	command.Dir = s.rootDir
 	outputBytes, err := command.CombinedOutput()
 	output := string(outputBytes)
 	exitCode := 0
 
 	if err != nil {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return scanResponse{}, context.Canceled
+		}
+
 		var exitError *exec.ExitError
 		if errors.As(err, &exitError) {
 			exitCode = exitError.ExitCode()
@@ -285,6 +402,11 @@ func (s *server) runVisualScan() (scanResponse, error) {
 	if exitCode != 0 {
 		message = "Visual scan completed and found differences that need review."
 	}
+	if sectionID != "" && exitCode == 0 {
+		message = "Section scan completed and matches the approved baseline."
+	} else if sectionID != "" {
+		message = "Section scan completed and found differences that need review."
+	}
 
 	return scanResponse{
 		Message:  message,
@@ -293,6 +415,264 @@ func (s *server) runVisualScan() (scanResponse, error) {
 		History:  history,
 		Manifest: manifest,
 	}, nil
+}
+
+func (s server) addVisualSection(w http.ResponseWriter, r *http.Request) (sectionResponse, error) {
+	name, pageURL, imageBytes, err := readSectionUpload(w, r)
+	if err != nil {
+		return sectionResponse{}, err
+	}
+
+	pagesManifest, err := s.readVisualPagesManifest()
+	if err != nil {
+		return sectionResponse{}, fmt.Errorf("Could not read visual sections.")
+	}
+
+	resolvedURL, pagePath, err := resolveSectionURL(pageURL, pagesManifest.TargetURL)
+	if err != nil {
+		return sectionResponse{}, err
+	}
+
+	sectionID := uniqueSectionID(slugFromText(name), pagesManifest.Pages)
+	baselineFileName := makeBaselineFileName(sectionID)
+	section := visualPage{
+		ID:               sectionID,
+		Name:             name,
+		Path:             pagePath,
+		URL:              resolvedURL,
+		SnapshotName:     sectionID + ".png",
+		BaselineFileName: baselineFileName,
+		BaselineImageURL: "/assets/baselines/visual-test-sample/" + baselineFileName,
+		SnapshotPath:     "tests/visual-test-sample.spec.ts-snapshots/" + baselineFileName,
+		ManualBaseline:   true,
+	}
+
+	destinationPath := filepath.Join(s.snapshotDir, baselineFileName)
+	if err := writeFileAtomic(destinationPath, imageBytes); err != nil {
+		return sectionResponse{}, fmt.Errorf("Could not save the uploaded baseline image.")
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	pagesManifest.GeneratedAt = now
+	pagesManifest.Pages = append(pagesManifest.Pages, section)
+	if pagesManifest.Version == 0 {
+		pagesManifest.Version = 1
+	}
+	if pagesManifest.TargetURL == "" {
+		pagesManifest.TargetURL = defaultTargetURL
+	}
+
+	if err := s.writeVisualPagesManifest(pagesManifest); err != nil {
+		return sectionResponse{}, fmt.Errorf("Could not register the uploaded visual section.")
+	}
+
+	manifest := s.visualPagesToManifest(pagesManifest)
+	return sectionResponse{
+		Message:  "Section added. Run a visual scan to compare it against the uploaded baseline.",
+		Section:  visualPageToItem(section, pagesManifest.GeneratedAt),
+		Manifest: manifest,
+	}, nil
+}
+
+func (s server) updateVisualSectionBaseline(w http.ResponseWriter, r *http.Request, sectionID string) (sectionResponse, error) {
+	imageBytes, err := readBaselineImageUpload(w, r)
+	if err != nil {
+		return sectionResponse{}, err
+	}
+
+	pagesManifest, err := s.readVisualPagesManifest()
+	if err != nil {
+		return sectionResponse{}, fmt.Errorf("Could not read visual sections.")
+	}
+
+	sectionIndex := -1
+	for index, section := range pagesManifest.Pages {
+		if section.ID == sectionID {
+			sectionIndex = index
+			break
+		}
+	}
+
+	if sectionIndex == -1 {
+		return sectionResponse{}, fmt.Errorf("The selected section could not be found.")
+	}
+
+	section := pagesManifest.Pages[sectionIndex]
+	if section.BaselineFileName == "" {
+		section.BaselineFileName = makeBaselineFileName(section.ID)
+	}
+	if section.SnapshotPath == "" {
+		section.SnapshotPath = "tests/visual-test-sample.spec.ts-snapshots/" + section.BaselineFileName
+	}
+	if section.BaselineImageURL == "" {
+		section.BaselineImageURL = "/assets/baselines/visual-test-sample/" + section.BaselineFileName
+	}
+
+	destinationPath := filepath.Join(s.snapshotDir, section.BaselineFileName)
+	if err := writeFileAtomic(destinationPath, imageBytes); err != nil {
+		return sectionResponse{}, fmt.Errorf("Could not replace the baseline image.")
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	section.ManualBaseline = true
+	pagesManifest.GeneratedAt = now
+	pagesManifest.Pages[sectionIndex] = section
+
+	if err := s.writeVisualPagesManifest(pagesManifest); err != nil {
+		return sectionResponse{}, fmt.Errorf("Could not update the selected section.")
+	}
+
+	manifest := s.visualPagesToManifest(pagesManifest)
+	return sectionResponse{
+		Message:  "Baseline image updated. Future visual scans will compare against this uploaded image.",
+		Section:  visualPageToItem(section, pagesManifest.GeneratedAt),
+		Manifest: manifest,
+	}, nil
+}
+
+func readSectionUpload(w http.ResponseWriter, r *http.Request) (string, string, []byte, error) {
+	formValues, imageBytes, err := readUploadForm(w, r)
+	if err != nil {
+		return "", "", nil, err
+	}
+
+	name := strings.TrimSpace(formValues.Get("name"))
+	pageURL := strings.TrimSpace(formValues.Get("url"))
+
+	if name == "" {
+		return "", "", nil, fmt.Errorf("Section name is required.")
+	}
+	if pageURL == "" {
+		return "", "", nil, fmt.Errorf("Page URL is required.")
+	}
+
+	return name, pageURL, imageBytes, nil
+}
+
+func readBaselineImageUpload(w http.ResponseWriter, r *http.Request) ([]byte, error) {
+	_, imageBytes, err := readUploadForm(w, r)
+	return imageBytes, err
+}
+
+func readUploadForm(w http.ResponseWriter, r *http.Request) (url.Values, []byte, error) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBaselineUploadSize+1)
+	if err := r.ParseMultipartForm(maxBaselineUploadSize); err != nil {
+		return nil, nil, fmt.Errorf("Upload a PNG baseline image smaller than 20 MB.")
+	}
+
+	file, _, err := r.FormFile("baselineImage")
+	if err != nil {
+		return nil, nil, fmt.Errorf("Baseline image upload is required.")
+	}
+	defer file.Close()
+
+	imageBytes, err := io.ReadAll(io.LimitReader(file, maxBaselineUploadSize+1))
+	if err != nil {
+		return nil, nil, fmt.Errorf("Could not read the uploaded baseline image.")
+	}
+	if int64(len(imageBytes)) > maxBaselineUploadSize {
+		return nil, nil, fmt.Errorf("Upload a PNG baseline image smaller than 20 MB.")
+	}
+	if !isPNG(imageBytes) {
+		return nil, nil, fmt.Errorf("Only PNG baseline images are supported.")
+	}
+
+	formValues := url.Values{}
+	if r.MultipartForm != nil {
+		for key, values := range r.MultipartForm.Value {
+			formValues[key] = values
+		}
+	}
+
+	return formValues, imageBytes, nil
+}
+
+func isPNG(imageBytes []byte) bool {
+	return bytes.HasPrefix(imageBytes, []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'})
+}
+
+func resolveSectionURL(rawURL string, baseURL string) (string, string, error) {
+	base := defaultTargetURL
+	if strings.TrimSpace(baseURL) != "" {
+		base = strings.TrimSpace(baseURL)
+	}
+
+	parsedBase, err := url.Parse(base)
+	if err != nil {
+		return "", "", fmt.Errorf("The configured target URL is invalid.")
+	}
+
+	parsedURL, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return "", "", fmt.Errorf("Page URL is invalid.")
+	}
+	if !parsedURL.IsAbs() {
+		parsedURL = parsedBase.ResolveReference(parsedURL)
+	}
+	if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
+		return "", "", fmt.Errorf("Page URL must be an HTTP or HTTPS URL.")
+	}
+
+	parsedURL.Fragment = ""
+	pagePath := parsedURL.EscapedPath()
+	if pagePath == "" {
+		pagePath = "/"
+	}
+	if parsedURL.RawQuery != "" {
+		pagePath += "?" + parsedURL.RawQuery
+	}
+
+	return parsedURL.String(), pagePath, nil
+}
+
+func slugFromText(value string) string {
+	var builder strings.Builder
+	previousHyphen := false
+
+	for _, character := range strings.ToLower(value) {
+		if unicode.IsLetter(character) || unicode.IsDigit(character) {
+			builder.WriteRune(character)
+			previousHyphen = false
+			continue
+		}
+
+		if !previousHyphen {
+			builder.WriteByte('-')
+			previousHyphen = true
+		}
+	}
+
+	slug := strings.Trim(builder.String(), "-")
+	if slug == "" {
+		slug = "manual-section"
+	}
+	if !strings.HasSuffix(slug, "-page") {
+		slug += "-page"
+	}
+
+	return slug
+}
+
+func uniqueSectionID(baseID string, pages []visualPage) string {
+	usedIDs := make(map[string]bool, len(pages))
+	for _, page := range pages {
+		usedIDs[page.ID] = true
+	}
+
+	if !usedIDs[baseID] {
+		return baseID
+	}
+
+	for index := 2; ; index++ {
+		candidate := fmt.Sprintf("%s-%d", baseID, index)
+		if !usedIDs[candidate] {
+			return candidate
+		}
+	}
+}
+
+func makeBaselineFileName(sectionID string) string {
+	return fmt.Sprintf("%s-chromium-%s.png", sectionID, runtime.GOOS)
 }
 
 func (s server) acceptOneRevisionItem(revisionID string, itemID string) (acceptResponse, error) {
@@ -441,6 +821,99 @@ func (s server) updateHistoryForRevision(manifest revisionManifest) (visualHisto
 	return history, nil
 }
 
+func (s server) readVisualPagesManifest() (visualPagesManifest, error) {
+	manifestPath := filepath.Join(s.rootDir, "tests", "visual-pages.json")
+	manifest, err := readJSON[visualPagesManifest](manifestPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return visualPagesManifest{
+				Version:     1,
+				TargetURL:   defaultTargetURL,
+				GeneratedAt: time.Now().UTC().Format(time.RFC3339Nano),
+				Pages:       []visualPage{},
+			}, nil
+		}
+
+		return visualPagesManifest{}, err
+	}
+
+	if manifest.Version == 0 {
+		manifest.Version = 1
+	}
+	if manifest.TargetURL == "" {
+		manifest.TargetURL = defaultTargetURL
+	}
+
+	return manifest, nil
+}
+
+func (s server) writeVisualPagesManifest(manifest visualPagesManifest) error {
+	return writeJSONFile(filepath.Join(s.rootDir, "tests", "visual-pages.json"), manifest)
+}
+
+func (s server) visualPagesToManifest(pagesManifest visualPagesManifest) revisionManifest {
+	items := make([]visualItem, 0, len(pagesManifest.Pages))
+	for _, page := range pagesManifest.Pages {
+		items = append(items, visualPageToItem(page, pagesManifest.GeneratedAt))
+	}
+
+	generatedAt := pagesManifest.GeneratedAt
+	if generatedAt == "" {
+		generatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+
+	return revisionManifest{
+		Version:     1,
+		Status:      statusBaseline,
+		CreatedAt:   generatedAt,
+		GeneratedAt: generatedAt,
+		Label:       "Registered sections",
+		TargetURL:   pagesManifest.TargetURL,
+		TotalPages:  len(items),
+		Items:       items,
+	}
+}
+
+func visualPageToItem(page visualPage, generatedAt string) visualItem {
+	if generatedAt == "" {
+		generatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+
+	baselineFileName := page.BaselineFileName
+	if baselineFileName == "" {
+		baselineFileName = makeBaselineFileName(page.ID)
+	}
+
+	snapshotPath := page.SnapshotPath
+	if snapshotPath == "" {
+		snapshotPath = "tests/visual-test-sample.spec.ts-snapshots/" + baselineFileName
+	}
+
+	baselineImageURL := page.BaselineImageURL
+	if baselineImageURL == "" {
+		baselineImageURL = "/assets/baselines/visual-test-sample/" + baselineFileName
+	}
+
+	return visualItem{
+		ID:               page.ID,
+		Name:             page.Name,
+		Source:           "Visual Test Sample",
+		TargetURL:        page.URL,
+		Browser:          "Chromium",
+		Viewport:         "1440 x 900",
+		SnapshotName:     page.SnapshotName,
+		BaselineFileName: baselineFileName,
+		BaselineImageURL: baselineImageURL,
+		SnapshotPath:     snapshotPath,
+		Path:             page.Path,
+		URL:              page.URL,
+		Status:           statusBaseline,
+		GeneratedAt:      generatedAt,
+		Summary:          page.Name + " baseline is ready.",
+		Description:      "This screenshot is the original approved image used for future comparisons.",
+	}
+}
+
 func (s server) safeRepoPath(relativePath string) (string, error) {
 	if relativePath == "" || filepath.IsAbs(relativePath) {
 		return "", errors.New("path must be relative")
@@ -497,6 +970,19 @@ func copyFile(sourcePath string, destinationPath string) error {
 	}
 
 	if err := destination.Close(); err != nil {
+		return err
+	}
+
+	return os.Rename(tempPath, destinationPath)
+}
+
+func writeFileAtomic(destinationPath string, content []byte) error {
+	if err := os.MkdirAll(filepath.Dir(destinationPath), 0o755); err != nil {
+		return err
+	}
+
+	tempPath := destinationPath + ".tmp"
+	if err := os.WriteFile(tempPath, content, 0o644); err != nil {
 		return err
 	}
 

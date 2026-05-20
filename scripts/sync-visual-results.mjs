@@ -136,11 +136,19 @@ async function readLastRunStatus() {
   return typeof lastRun?.status === 'string' ? lastRun.status : null;
 }
 
-async function readVisualPages() {
+async function readVisualPages(sectionId = null) {
   const manifest = await readJson(visualPagesPath, null);
 
   if (Array.isArray(manifest?.pages) && manifest.pages.length > 0) {
-    return manifest.pages.map((page) => ({
+    const pages = sectionId
+      ? manifest.pages.filter((page) => page.id === sectionId)
+      : manifest.pages;
+
+    if (sectionId && pages.length === 0) {
+      throw new Error(`Unknown visual section: ${sectionId}`);
+    }
+
+    return pages.map((page) => ({
       ...defaultProject,
       ...page,
       source: 'Visual Test Sample',
@@ -219,7 +227,7 @@ async function pruneOldRevisions(revisions) {
 }
 
 export async function syncVisualResults(options = {}) {
-  const visualPages = await readVisualPages();
+  const visualPages = await readVisualPages(options.sectionId ?? null);
   const lastRunStatus = await readLastRunStatus();
   const testWasRun = typeof options.exitCode === 'number' || lastRunStatus !== null;
   const createdAt = new Date();

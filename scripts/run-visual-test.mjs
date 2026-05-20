@@ -8,25 +8,40 @@ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const playwrightCli = path.join(rootDir, 'node_modules', 'playwright', 'cli.js');
 const updateSnapshots = process.argv.includes('--update-snapshots');
 
-await crawlVisualBaselines({ update: updateSnapshots });
+function getArgValue(name) {
+  const prefix = `--${name}=`;
+  const match = process.argv.find((arg) => arg.startsWith(prefix));
+  return match ? match.slice(prefix.length) : null;
+}
+
+const sectionId = getArgValue('section') ?? process.env.VISUAL_SECTION_ID ?? null;
+const passthroughArgs = process.argv
+  .slice(2)
+  .filter((arg) => !arg.startsWith('--section='));
+
+await crawlVisualBaselines({ update: updateSnapshots, sectionId });
 
 const args = [
   playwrightCli,
   'test',
   'tests/visual-test-sample.spec.ts',
   '--project=chromium',
-  ...process.argv.slice(2),
+  ...passthroughArgs,
 ];
 
 const testProcess = spawn(process.execPath, args, {
   stdio: 'inherit',
+  env: {
+    ...process.env,
+    ...(sectionId ? { VISUAL_SECTION_ID: sectionId } : {}),
+  },
 });
 
 testProcess.on('close', async (exitCode) => {
   const normalizedExitCode = exitCode ?? 1;
 
   try {
-    await syncVisualResults({ exitCode: normalizedExitCode });
+    await syncVisualResults({ exitCode: normalizedExitCode, sectionId });
   } catch (error) {
     console.error('Failed to sync visual result artifacts:', error);
     process.exit(1);

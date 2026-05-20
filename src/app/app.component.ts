@@ -71,6 +71,12 @@ type VisualScanResponse = {
   readonly manifest: VisualManifest;
 };
 
+type SectionResponse = {
+  readonly message: string;
+  readonly section: VisualBaseline;
+  readonly manifest: VisualManifest;
+};
+
 const DEFAULT_BASELINES: readonly VisualBaseline[] = [
   {
     id: 'home-page',
@@ -112,6 +118,14 @@ export class AppComponent implements OnInit, OnDestroy {
   readonly scanning = signal(false);
   readonly scanMessage = signal<string | null>(null);
   readonly scanError = signal<string | null>(null);
+  readonly cancelingScan = signal(false);
+  readonly sectionFormOpen = signal(false);
+  readonly addingSection = signal(false);
+  readonly updatingBaseline = signal(false);
+  readonly selectedSectionImageName = signal('');
+  readonly selectedBaselineImageName = signal('');
+  readonly sectionMessage = signal<string | null>(null);
+  readonly sectionError = signal<string | null>(null);
   readonly imageVersion = signal('');
 
   readonly selectedBaseline = computed(() => {
@@ -127,8 +141,10 @@ export class AppComponent implements OnInit, OnDestroy {
   });
 
   readonly pageHeading = computed(() => {
-    return this.currentPage() === 'history' ? 'Visual Reports and Snapshot History' : 'Screenshot Comparison';
+    return this.currentPage() === 'history' ? 'Visual Reports and Snapshot History' : '';
   });
+
+  private scanAbortController: AbortController | null = null;
 
   private readonly handlePopState = (): void => {
     this.currentPage.set(this.pageFromLocation());
@@ -143,17 +159,21 @@ export class AppComponent implements OnInit, OnDestroy {
       if (history?.revisions.length) {
         this.revisions.set(history.revisions);
         await this.selectRevision(history.latestRevisionId ?? history.revisions[0].id);
+        await this.mergeAvailableSections();
         return;
       }
 
       const manifest = await this.fetchJson<VisualManifest>('/visual-results/manifest.json');
       this.applyManifest(manifest);
+      await this.mergeAvailableSections();
     } catch {
       this.baselines.set(DEFAULT_BASELINES);
+      await this.mergeAvailableSections();
     }
   }
 
   ngOnDestroy(): void {
+    this.scanAbortController?.abort();
     window.removeEventListener('popstate', this.handlePopState);
   }
 
@@ -188,6 +208,22 @@ export class AppComponent implements OnInit, OnDestroy {
 
   selectBaseline(baselineId: string): void {
     this.selectedBaselineId.set(baselineId);
+  }
+
+  toggleSectionForm(): void {
+    this.sectionFormOpen.update((isOpen) => !isOpen);
+    this.sectionMessage.set(null);
+    this.sectionError.set(null);
+  }
+
+  selectSectionUpload(event: Event): void {
+    const input = event.target as HTMLInputElement;
+    this.selectedSectionImageName.set(input.files?.[0]?.name ?? '');
+  }
+
+  selectBaselineUpload(event: Event): void {
+    const input = event.target as HTMLInputElement;
+    this.selectedBaselineImageName.set(input.files?.[0]?.name ?? '');
   }
 
   statusLabel(status: VisualStatus): string {
@@ -414,18 +450,35 @@ export class AppComponent implements OnInit, OnDestroy {
   }
 
   async runVisualScan(): Promise<void> {
+    await this.runVisualScanRequest('/api/visual-scan');
+  }
+
+  async runSelectedSectionScan(): Promise<void> {
+    const baseline = this.selectedBaseline();
+    await this.runVisualScanRequest(`/api/visual-sections/${encodeURIComponent(baseline.id)}/scan`);
+  }
+
+  private async runVisualScanRequest(endpoint: string): Promise<void> {
     if (this.scanning()) {
       return;
     }
 
+    const controller = new AbortController();
+    this.scanAbortController = controller;
     this.scanning.set(true);
+    this.cancelingScan.set(false);
     this.scanMessage.set(null);
     this.scanError.set(null);
     this.acceptMessage.set(null);
     this.acceptError.set(null);
+    this.sectionMessage.set(null);
+    this.sectionError.set(null);
 
     try {
-      const response = await fetch('/api/visual-scan', { method: 'POST' });
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        signal: controller.signal,
+      });
       const payload = await response.json() as VisualScanResponse | { error?: string };
 
       if (!response.ok) {
@@ -440,12 +493,131 @@ export class AppComponent implements OnInit, OnDestroy {
       }));
       this.selectedRevisionId.set(scanPayload.manifest.revisionId ?? scanPayload.history.latestRevisionId ?? '');
       this.applyManifest(scanPayload.manifest);
+      await this.mergeAvailableSections();
       this.scanMessage.set(scanPayload.message);
       this.imageVersion.set(String(Date.now()));
     } catch (error) {
-      this.scanError.set(error instanceof Error ? error.message : 'Could not run the visual scan.');
+      if (this.isAbortError(error)) {
+        this.scanMessage.set('Visual scan canceled.');
+      } else {
+        this.scanError.set(error instanceof Error ? error.message : 'Could not run the visual scan.');
+      }
     } finally {
+      if (this.scanAbortController === controller) {
+        this.scanAbortController = null;
+      }
+      this.cancelingScan.set(false);
       this.scanning.set(false);
+    }
+  }
+
+  cancelVisualScan(): void {
+    if (!this.scanning() || this.cancelingScan()) {
+      return;
+    }
+
+    this.cancelingScan.set(true);
+    this.scanAbortController?.abort();
+  }
+
+  async addSection(event: SubmitEvent): Promise<void> {
+    event.preventDefault();
+
+    if (this.addingSection()) {
+      return;
+    }
+
+    const form = event.currentTarget as HTMLFormElement;
+    const formData = new FormData(form);
+
+    this.addingSection.set(true);
+    this.sectionMessage.set(null);
+    this.sectionError.set(null);
+
+    try {
+      const response = await fetch('/api/visual-sections', {
+        method: 'POST',
+        body: formData,
+      });
+      const payload = await response.json() as SectionResponse | { error?: string };
+
+      if (!response.ok) {
+        throw new Error('error' in payload && payload.error ? payload.error : 'Could not add this section.');
+      }
+
+      const sectionPayload = payload as SectionResponse;
+      this.mergeSection(sectionPayload.section);
+      this.selectedBaselineId.set(sectionPayload.section.id);
+      this.sectionMessage.set(sectionPayload.message);
+      this.sectionError.set(null);
+      this.selectedSectionImageName.set('');
+      this.imageVersion.set(String(Date.now()));
+      form.reset();
+    } catch (error) {
+      this.sectionError.set(error instanceof Error ? error.message : 'Could not add this section.');
+    } finally {
+      this.addingSection.set(false);
+    }
+  }
+
+  async updateSelectedBaselineImage(event: SubmitEvent): Promise<void> {
+    event.preventDefault();
+
+    if (this.updatingBaseline()) {
+      return;
+    }
+
+    const form = event.currentTarget as HTMLFormElement;
+    const formData = new FormData(form);
+    await this.uploadSelectedBaselineImage(formData);
+    form.reset();
+  }
+
+  async overrideSelectedBaselineImage(event: Event): Promise<void> {
+    const input = event.target as HTMLInputElement;
+    const file = input.files?.[0];
+
+    if (!file || this.updatingBaseline()) {
+      return;
+    }
+
+    const formData = new FormData();
+    formData.append('baselineImage', file);
+    await this.uploadSelectedBaselineImage(formData);
+    input.value = '';
+  }
+
+  private async uploadSelectedBaselineImage(formData: FormData): Promise<void> {
+    const baseline = this.selectedBaseline();
+    if (!baseline || this.updatingBaseline()) {
+      return;
+    }
+
+    this.updatingBaseline.set(true);
+    this.sectionMessage.set(null);
+    this.sectionError.set(null);
+
+    try {
+      const response = await fetch(`/api/visual-sections/${encodeURIComponent(baseline.id)}/baseline`, {
+        method: 'POST',
+        body: formData,
+      });
+      const payload = await response.json() as SectionResponse | { error?: string };
+
+      if (!response.ok) {
+        throw new Error('error' in payload && payload.error ? payload.error : 'Could not update this baseline image.');
+      }
+
+      const sectionPayload = payload as SectionResponse;
+      this.mergeSection(sectionPayload.section);
+      this.selectedBaselineId.set(sectionPayload.section.id);
+      this.sectionMessage.set(sectionPayload.message);
+      this.selectedBaselineImageName.set('');
+      this.imageVersion.set(String(Date.now()));
+    } catch (error) {
+      this.sectionError.set(error instanceof Error ? error.message : 'Could not update this baseline image.');
+    } finally {
+      this.updatingBaseline.set(false);
     }
   }
 
@@ -468,6 +640,10 @@ export class AppComponent implements OnInit, OnDestroy {
     }
 
     return await response.json() as T;
+  }
+
+  private isAbortError(error: unknown): boolean {
+    return typeof error === 'object' && error !== null && 'name' in error && error.name === 'AbortError';
   }
 
   private applyManifest(manifest: VisualManifest | null): void {
@@ -494,6 +670,41 @@ export class AppComponent implements OnInit, OnDestroy {
     this.applyManifest(payload.manifest);
     this.acceptMessage.set(payload.message);
     this.imageVersion.set(String(Date.now()));
+  }
+
+  private async mergeAvailableSections(): Promise<void> {
+    const manifest = await this.fetchJson<VisualManifest>('/api/visual-sections').catch(() => null);
+    if (!manifest?.items.length) {
+      return;
+    }
+
+    this.baselines.update((baselines) => {
+      const existingIds = new Set(baselines.map((baseline) => baseline.id));
+      const missingSections = manifest.items.filter((section) => !existingIds.has(section.id));
+      return missingSections.length ? [...baselines, ...missingSections] : baselines;
+    });
+  }
+
+  private mergeSection(section: VisualBaseline): void {
+    this.baselines.update((baselines) => {
+      const sectionIndex = baselines.findIndex((baseline) => baseline.id === section.id);
+      if (sectionIndex === -1) {
+        return [...baselines, section];
+      }
+
+      return baselines.map((baseline, index) => index === sectionIndex
+        ? {
+            ...baseline,
+            ...section,
+            status: baseline.status,
+            actualImageUrl: baseline.actualImageUrl,
+            diffImageUrl: baseline.diffImageUrl,
+            actualPath: baseline.actualPath,
+            diffPath: baseline.diffPath,
+            errorContextPath: baseline.errorContextPath,
+          }
+        : baseline);
+    });
   }
 
   private navigateTo(path: string, page: DashboardPage): void {

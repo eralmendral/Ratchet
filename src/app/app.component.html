@@ -1,8 +1,38 @@
-<main class="dashboard-shell">
-  <aside class="baseline-rail" aria-label="Original screenshot baselines">
+<main class="dashboard-shell" [attr.aria-busy]="scanning()">
+  <aside class="baseline-rail" aria-label="Original screenshot baselines" [attr.inert]="scanning() ? '' : null">
     <div class="rail-header">
       <p class="eyebrow">Sections</p>
+      <button class="add-section-button" type="button" (click)="toggleSectionForm()">
+        {{ sectionFormOpen() ? 'Close' : 'Add section' }}
+      </button>
     </div>
+
+    @if (sectionFormOpen()) {
+      <form class="section-form" (submit)="addSection($event)">
+        <label>
+          <span>Section name</span>
+          <input name="name" type="text" autocomplete="off" required placeholder="Checkout page">
+        </label>
+        <label>
+          <span>Page URL</span>
+          <input name="url" type="url" required [value]="selectedBaseline().targetUrl" placeholder="https://example.com/page">
+        </label>
+        <label class="file-field">
+          <span>Baseline PNG</span>
+          <input name="baselineImage" type="file" accept="image/png" required (change)="selectSectionUpload($event)">
+          <small>{{ selectedSectionImageName() || 'Choose a PNG image' }}</small>
+        </label>
+        <button type="submit" [disabled]="addingSection()">
+          {{ addingSection() ? 'Adding...' : 'Save section' }}
+        </button>
+      </form>
+    }
+
+    @if (sectionMessage() || sectionError()) {
+      <div class="section-status" [class.section-status--error]="sectionError()">
+        {{ sectionError() ?? sectionMessage() }}
+      </div>
+    }
 
     <div class="baseline-list">
       @for (baseline of baselines(); track baseline.id) {
@@ -22,19 +52,22 @@
         </button>
       }
     </div>
+
   </aside>
 
-  <section class="comparison-workspace" aria-label="Visual comparison workspace">
+  <section class="comparison-workspace" aria-label="Visual comparison workspace" [attr.inert]="scanning() ? '' : null">
     @if (selectedBaseline(); as baseline) {
       <header class="workspace-header">
         <div>
           <p class="eyebrow">{{ pageEyebrow() }}</p>
-          <h1>{{ pageHeading() }}</h1>
+          @if (pageHeading(); as heading) {
+            <h1>{{ heading }}</h1>
+          }
         </div>
         <div class="workspace-actions">
           @if (currentPage() === 'history') {
             <button class="nav-button nav-button--secondary" type="button" (click)="goToDashboard()">
-              Screenshot Comparison
+              Dashboard
             </button>
           } @else {
             <button class="nav-button nav-button--secondary" type="button" (click)="goToHistory()">
@@ -43,6 +76,11 @@
             <a class="target-link" [href]="baseline.targetUrl" target="_blank" rel="noreferrer">
               Open Target
             </a>
+          }
+          @if (currentPage() !== 'history') {
+            <button class="scan-button section-scan-button" type="button" [disabled]="scanning()" (click)="runSelectedSectionScan()">
+              {{ scanning() ? 'Scanning...' : 'Run section scan' }}
+            </button>
           }
           <button class="scan-button" type="button" [disabled]="scanning()" (click)="runVisualScan()">
             {{ scanning() ? 'Scanning...' : 'Run visual scan' }}
@@ -61,7 +99,10 @@
           <article class="preview-panel original-panel">
             <div class="panel-heading">
               <span>Original Baseline</span>
-              <small>{{ baseline.browser }} · {{ baseline.viewport }}</small>
+              <label class="inline-upload-button">
+                <input type="file" accept="image/png" [disabled]="updatingBaseline()" (change)="overrideSelectedBaselineImage($event)">
+                <span>{{ updatingBaseline() ? 'Updating...' : 'Override baseline' }}</span>
+              </label>
             </div>
             <div class="image-frame">
               <img [src]="imageSrc(baseline.baselineImageUrl)" [alt]="baseline.source + ' original baseline screenshot'">
@@ -196,4 +237,29 @@
       }
     }
   </section>
+
+  @if (scanning()) {
+    <section class="scan-overlay" role="alertdialog" aria-modal="true" aria-labelledby="scan-overlay-title">
+      <div class="scan-modal">
+        <div class="scan-animation" aria-hidden="true">
+          <span></span>
+          <span></span>
+          <span></span>
+        </div>
+        <div>
+          <p class="eyebrow">Visual Scan</p>
+          <h2 id="scan-overlay-title">{{ cancelingScan() ? 'Canceling scan...' : 'Comparing screenshots...' }}</h2>
+          <p>{{ cancelingScan() ? 'Stopping the running visual scan and returning control.' : 'Capturing current pages, checking pixels, and preparing the visual report.' }}</p>
+        </div>
+        <div class="scan-skeleton" aria-hidden="true">
+          <span></span>
+          <span></span>
+          <span></span>
+        </div>
+        <button class="cancel-scan-button" type="button" [disabled]="cancelingScan()" (click)="cancelVisualScan()">
+          {{ cancelingScan() ? 'Canceling...' : 'Cancel scan' }}
+        </button>
+      </div>
+    </section>
+  }
 </main>
