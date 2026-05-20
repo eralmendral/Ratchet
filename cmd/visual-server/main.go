@@ -30,9 +30,55 @@ const (
 )
 
 const (
+	defaultProjectID      = "visual-test-sample"
+	defaultProjectName    = "Visual Test Sample"
 	defaultTargetURL      = "https://visual-test-sample.vercel.app/"
 	maxBaselineUploadSize = 20 << 20
 )
+
+type visualProjectRegistry struct {
+	Version          int             `json:"version"`
+	DefaultProjectID string          `json:"defaultProjectId"`
+	Projects         []visualProject `json:"projects"`
+}
+
+type visualProject struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	TargetURL string `json:"targetUrl"`
+	CreatedAt string `json:"createdAt,omitempty"`
+	UpdatedAt string `json:"updatedAt,omitempty"`
+}
+
+type visualProjectStats struct {
+	LatestStatus   visualStatus `json:"latestStatus"`
+	ChangedPages   int          `json:"changedPages"`
+	TotalSections  int          `json:"totalSections"`
+	LastScanTime   string       `json:"lastScanTime,omitempty"`
+	TotalRevisions int          `json:"totalRevisions"`
+}
+
+type visualProjectSummary struct {
+	ID        string             `json:"id"`
+	Name      string             `json:"name"`
+	TargetURL string             `json:"targetUrl"`
+	CreatedAt string             `json:"createdAt,omitempty"`
+	UpdatedAt string             `json:"updatedAt,omitempty"`
+	Stats     visualProjectStats `json:"stats"`
+}
+
+type projectsResponse struct {
+	Version          int                    `json:"version"`
+	DefaultProjectID string                 `json:"defaultProjectId"`
+	Projects         []visualProjectSummary `json:"projects"`
+}
+
+type projectContext struct {
+	Project         visualProject
+	VisualPagesPath string
+	SnapshotDir     string
+	ResultsDir      string
+}
 
 type visualPagesManifest struct {
 	Version     int          `json:"version"`
@@ -138,13 +184,22 @@ type sectionResponse struct {
 	Manifest revisionManifest `json:"manifest"`
 }
 
+type sectionDeleteResponse struct {
+	Message  string           `json:"message"`
+	Manifest revisionManifest `json:"manifest"`
+}
+
+type sectionRefreshResponse struct {
+	Message  string           `json:"message"`
+	Output   string           `json:"output,omitempty"`
+	Manifest revisionManifest `json:"manifest"`
+}
+
 type server struct {
-	rootDir          string
-	staticDir        string
-	visualResultsDir string
-	snapshotDir      string
-	scanMu           sync.Mutex
-	scanning         bool
+	rootDir   string
+	staticDir string
+	scanMu    sync.Mutex
+	scanning  bool
 }
 
 func main() {
@@ -154,20 +209,24 @@ func main() {
 	}
 
 	s := server{
-		rootDir:          rootDir,
-		staticDir:        filepath.Join(rootDir, "dist", "ratchet", "browser"),
-		visualResultsDir: filepath.Join(rootDir, "public", "visual-results"),
-		snapshotDir:      filepath.Join(rootDir, "tests", "visual-test-sample.spec.ts-snapshots"),
+		rootDir:   rootDir,
+		staticDir: filepath.Join(rootDir, "dist", "ratchet", "browser"),
+	}
+	if _, err := s.ensureProjectRegistry(); err != nil {
+		log.Fatal(err)
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/health", s.handleHealth)
+	mux.HandleFunc("/api/projects", s.handleProjects)
+	mux.HandleFunc("/api/projects/", s.handleProject)
 	mux.HandleFunc("/api/visual-scan", s.handleVisualScan)
 	mux.HandleFunc("/api/visual-revisions/", s.handleVisualRevision)
 	mux.HandleFunc("/api/visual-sections", s.handleVisualSections)
+	mux.HandleFunc("/api/visual-sections/crawl", s.handleVisualSectionsCrawl)
 	mux.HandleFunc("/api/visual-sections/", s.handleVisualSection)
-	mux.Handle("/visual-results/", http.StripPrefix("/visual-results/", http.FileServer(http.Dir(s.visualResultsDir))))
-	mux.Handle("/assets/baselines/visual-test-sample/", http.StripPrefix("/assets/baselines/visual-test-sample/", http.FileServer(http.Dir(s.snapshotDir))))
+	mux.Handle("/visual-results/", http.StripPrefix("/visual-results/", http.FileServer(http.Dir(filepath.Join(rootDir, "public", "visual-results")))))
+	mux.HandleFunc("/assets/baselines/", s.handleBaselineAsset)
 	mux.HandleFunc("/", s.handleStatic)
 
 	port := os.Getenv("PORT")
@@ -182,7 +241,7 @@ func main() {
 func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 
 		if r.Method == http.MethodOptions {
@@ -198,18 +257,74 @@ func (s server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-func (s server) handleVisualSections(w http.ResponseWriter, r *http.Request) {
+func (s server) handleProjects(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		manifest, err := s.readVisualPagesManifest()
+		registry, err := s.ensureProjectRegistry()
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "Could not read visual projects.")
+			return
+		}
+
+		response, err := s.projectsResponse(registry)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "Could not read visual project stats.")
+			return
+		}
+
+		writeJSON(w, http.StatusOK, response)
+	case http.MethodPost:
+		project, err := s.createProject(w, r)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		writeJSON(w, http.StatusOK, project)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "Only GET and POST are supported.")
+	}
+}
+
+func (s server) handleProject(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "Only GET is supported.")
+		return
+	}
+
+	projectID := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/projects/"), "/")
+	if projectID == "" || strings.Contains(projectID, "/") {
+		writeError(w, http.StatusBadRequest, "The selected visual project is invalid.")
+		return
+	}
+
+	project, err := s.projectSummary(projectID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, project)
+}
+
+func (s *server) handleVisualSections(w http.ResponseWriter, r *http.Request) {
+	project, err := s.projectFromRequest(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		manifest, err := s.readVisualPagesManifest(project)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "Could not read visual sections.")
 			return
 		}
 
-		writeJSON(w, http.StatusOK, s.visualPagesToManifest(manifest))
+		writeJSON(w, http.StatusOK, s.visualPagesToManifest(project, manifest))
 	case http.MethodPost:
-		response, err := s.addVisualSection(w, r)
+		response, err := s.addVisualSection(w, r, project)
 		if err != nil {
 			log.Printf("add visual section failed: %v", err)
 			writeError(w, http.StatusBadRequest, err.Error())
@@ -222,14 +337,85 @@ func (s server) handleVisualSections(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s server) handleVisualSection(w http.ResponseWriter, r *http.Request) {
+func (s *server) handleVisualSectionsCrawl(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "Only POST is supported.")
 		return
 	}
 
+	project, err := s.projectFromRequest(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	update, err := readSectionRefreshRequest(w, r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	response, err := s.runVisualSectionsRefresh(r.Context(), project, update)
+	if err != nil {
+		log.Printf("refresh visual sections failed: %v", err)
+		if errors.Is(err, errScanAlreadyRunning) {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (s *server) handleVisualSection(w http.ResponseWriter, r *http.Request) {
+	project, err := s.projectFromRequest(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	pathSuffix := strings.TrimPrefix(r.URL.Path, "/api/visual-sections/")
 	parts := strings.Split(strings.Trim(pathSuffix, "/"), "/")
+
+	if r.Method == http.MethodDelete {
+		if len(parts) != 1 || parts[0] == "" || strings.Contains(parts[0], "..") {
+			writeError(w, http.StatusBadRequest, "Use DELETE /api/visual-sections/{sectionID}.")
+			return
+		}
+
+		response, err := s.deleteVisualSection(project, parts[0])
+		if err != nil {
+			log.Printf("delete visual section failed: %v", err)
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "Only POST and DELETE are supported.")
+		return
+	}
+
+	if len(parts) == 1 && parts[0] != "" && !strings.Contains(parts[0], "..") {
+		response, err := s.updateVisualSectionDetails(w, r, project, parts[0])
+		if err != nil {
+			log.Printf("update visual section failed: %v", err)
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+
 	if len(parts) != 2 || parts[0] == "" || strings.Contains(parts[0], "..") {
 		writeError(w, http.StatusBadRequest, "Use /api/visual-sections/{sectionID}/baseline or /api/visual-sections/{sectionID}/scan.")
 		return
@@ -237,7 +423,7 @@ func (s server) handleVisualSection(w http.ResponseWriter, r *http.Request) {
 
 	switch parts[1] {
 	case "baseline":
-		response, err := s.updateVisualSectionBaseline(w, r, parts[0])
+		response, err := s.updateVisualSectionBaseline(w, r, project, parts[0])
 		if err != nil {
 			log.Printf("update section baseline failed: %v", err)
 			writeError(w, http.StatusBadRequest, err.Error())
@@ -246,7 +432,7 @@ func (s server) handleVisualSection(w http.ResponseWriter, r *http.Request) {
 
 		writeJSON(w, http.StatusOK, response)
 	case "scan":
-		response, err := s.runVisualScan(r.Context(), parts[0])
+		response, err := s.runVisualScan(r.Context(), project, parts[0])
 		if err != nil {
 			log.Printf("section visual scan failed: %v", err)
 			if errors.Is(err, errScanAlreadyRunning) {
@@ -272,7 +458,13 @@ func (s *server) handleVisualScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response, err := s.runVisualScan(r.Context(), "")
+	project, err := s.projectFromRequest(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	response, err := s.runVisualScan(r.Context(), project, "")
 	if err != nil {
 		log.Printf("visual scan failed: %v", err)
 		if errors.Is(err, errScanAlreadyRunning) {
@@ -295,6 +487,12 @@ func (s server) handleVisualRevision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	project, err := s.projectFromRequest(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	pathSuffix := strings.TrimPrefix(r.URL.Path, "/api/visual-revisions/")
 	parts := strings.Split(strings.Trim(pathSuffix, "/"), "/")
 	if len(parts) < 2 || parts[0] == "" || strings.Contains(parts[0], "..") {
@@ -304,13 +502,12 @@ func (s server) handleVisualRevision(w http.ResponseWriter, r *http.Request) {
 
 	revisionID := parts[0]
 	var response acceptResponse
-	var err error
 
 	switch {
 	case len(parts) == 2 && parts[1] == "accept-all":
-		response, err = s.acceptAllRevisionItems(revisionID)
+		response, err = s.acceptAllRevisionItems(project, revisionID)
 	case len(parts) == 4 && parts[1] == "items" && parts[3] == "accept" && parts[2] != "":
-		response, err = s.acceptOneRevisionItem(revisionID, parts[2])
+		response, err = s.acceptOneRevisionItem(project, revisionID, parts[2])
 	default:
 		writeError(w, http.StatusBadRequest, "Use a page-specific accept endpoint or accept-all.")
 		return
@@ -323,6 +520,35 @@ func (s server) handleVisualRevision(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, response)
+}
+
+func (s server) handleBaselineAsset(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeError(w, http.StatusMethodNotAllowed, "Only GET is supported.")
+		return
+	}
+
+	pathSuffix := strings.TrimPrefix(r.URL.Path, "/assets/baselines/")
+	parts := strings.SplitN(strings.Trim(pathSuffix, "/"), "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" || strings.Contains(parts[0], "..") || strings.Contains(parts[1], "..") {
+		http.NotFound(w, r)
+		return
+	}
+
+	projectID := parts[0]
+	fileName := filepath.Base(parts[1])
+	if fileName != parts[1] {
+		http.NotFound(w, r)
+		return
+	}
+
+	snapshotPath := filepath.Join(s.projectSnapshotDir(projectID), fileName)
+	if !isInside(s.projectSnapshotDir(projectID), snapshotPath) {
+		http.NotFound(w, r)
+		return
+	}
+
+	http.ServeFile(w, r, snapshotPath)
 }
 
 func (s server) handleStatic(w http.ResponseWriter, r *http.Request) {
@@ -349,24 +575,15 @@ func (s server) handleStatic(w http.ResponseWriter, r *http.Request) {
 
 var errScanAlreadyRunning = errors.New("A visual scan is already running.")
 
-func (s *server) runVisualScan(ctx context.Context, sectionID string) (scanResponse, error) {
-	s.scanMu.Lock()
-	if s.scanning {
-		s.scanMu.Unlock()
-		return scanResponse{}, errScanAlreadyRunning
+func (s *server) runVisualScan(ctx context.Context, project projectContext, sectionID string) (scanResponse, error) {
+	if err := s.beginVisualJob(); err != nil {
+		return scanResponse{}, err
 	}
-	s.scanning = true
-	s.scanMu.Unlock()
+	defer s.finishVisualJob()
 
-	defer func() {
-		s.scanMu.Lock()
-		s.scanning = false
-		s.scanMu.Unlock()
-	}()
-
-	commandArgs := []string{"run", "test:visual"}
+	commandArgs := []string{"run", "test:visual", "--", "--project=" + project.Project.ID}
 	if sectionID != "" {
-		commandArgs = append(commandArgs, "--", "--section="+sectionID)
+		commandArgs = append(commandArgs, "--section="+sectionID)
 	}
 
 	command := exec.CommandContext(ctx, "npm", commandArgs...)
@@ -388,12 +605,12 @@ func (s *server) runVisualScan(ctx context.Context, sectionID string) (scanRespo
 		}
 	}
 
-	history, err := readJSON[visualHistory](filepath.Join(s.visualResultsDir, "history.json"))
+	history, err := readJSON[visualHistory](filepath.Join(project.ResultsDir, "history.json"))
 	if err != nil {
 		return scanResponse{}, fmt.Errorf("The visual scan finished, but the revision history could not be read.")
 	}
 
-	manifest, err := readJSON[revisionManifest](filepath.Join(s.visualResultsDir, "manifest.json"))
+	manifest, err := readJSON[revisionManifest](filepath.Join(project.ResultsDir, "manifest.json"))
 	if err != nil {
 		return scanResponse{}, fmt.Errorf("The visual scan finished, but the latest visual revision could not be read.")
 	}
@@ -417,13 +634,642 @@ func (s *server) runVisualScan(ctx context.Context, sectionID string) (scanRespo
 	}, nil
 }
 
-func (s server) addVisualSection(w http.ResponseWriter, r *http.Request) (sectionResponse, error) {
+func (s *server) runVisualSectionsRefresh(ctx context.Context, project projectContext, update bool) (sectionRefreshResponse, error) {
+	if err := s.beginVisualJob(); err != nil {
+		return sectionRefreshResponse{}, err
+	}
+	defer s.finishVisualJob()
+
+	commandArgs := []string{"scripts/crawl-visual-baselines.mjs", "--project=" + project.Project.ID}
+	if update {
+		commandArgs = append(commandArgs, "--update")
+	}
+
+	command := exec.CommandContext(ctx, "node", commandArgs...)
+	command.Dir = s.rootDir
+	outputBytes, err := command.CombinedOutput()
+	output := string(outputBytes)
+
+	if err != nil {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return sectionRefreshResponse{}, context.Canceled
+		}
+		if output != "" {
+			log.Printf("visual section refresh output:\n%s", output)
+		}
+		if update {
+			return sectionRefreshResponse{}, fmt.Errorf("Could not update generated baselines.")
+		}
+		return sectionRefreshResponse{}, fmt.Errorf("Could not refresh visual sections.")
+	}
+
+	pagesManifest, err := s.readVisualPagesManifest(project)
+	if err != nil {
+		return sectionRefreshResponse{}, fmt.Errorf("Visual sections were refreshed, but the updated manifest could not be read.")
+	}
+
+	message := "Sections refreshed. New sections were added and missing baselines were captured."
+	if update {
+		message = "Generated baselines were updated for discovered sections."
+	}
+
+	return sectionRefreshResponse{
+		Message:  message,
+		Output:   output,
+		Manifest: s.visualPagesToManifest(project, pagesManifest),
+	}, nil
+}
+
+func (s *server) beginVisualJob() error {
+	s.scanMu.Lock()
+	defer s.scanMu.Unlock()
+
+	if s.scanning {
+		return errScanAlreadyRunning
+	}
+	s.scanning = true
+	return nil
+}
+
+func (s *server) finishVisualJob() {
+	s.scanMu.Lock()
+	s.scanning = false
+	s.scanMu.Unlock()
+}
+
+func (s server) projectFromRequest(r *http.Request) (projectContext, error) {
+	return s.projectByID(strings.TrimSpace(r.URL.Query().Get("project")))
+}
+
+func (s server) projectByID(projectID string) (projectContext, error) {
+	registry, err := s.ensureProjectRegistry()
+	if err != nil {
+		return projectContext{}, fmt.Errorf("Could not read visual projects.")
+	}
+
+	if projectID == "" {
+		projectID = registry.DefaultProjectID
+	}
+	if projectID == "" {
+		projectID = defaultProjectID
+	}
+	if !validProjectID(projectID) {
+		return projectContext{}, fmt.Errorf("The selected visual project is invalid.")
+	}
+
+	for _, project := range registry.Projects {
+		if project.ID == projectID {
+			return s.projectContext(project), nil
+		}
+	}
+
+	return projectContext{}, fmt.Errorf("The selected visual project could not be found.")
+}
+
+func (s server) projectsResponse(registry visualProjectRegistry) (projectsResponse, error) {
+	projects := make([]visualProjectSummary, 0, len(registry.Projects))
+	for _, project := range registry.Projects {
+		stats, err := s.projectStats(project)
+		if err != nil {
+			return projectsResponse{}, err
+		}
+		projects = append(projects, visualProjectSummary{
+			ID:        project.ID,
+			Name:      project.Name,
+			TargetURL: project.TargetURL,
+			CreatedAt: project.CreatedAt,
+			UpdatedAt: project.UpdatedAt,
+			Stats:     stats,
+		})
+	}
+
+	return projectsResponse{
+		Version:          registry.Version,
+		DefaultProjectID: registry.DefaultProjectID,
+		Projects:         projects,
+	}, nil
+}
+
+func (s server) projectSummary(projectID string) (visualProjectSummary, error) {
+	project, err := s.projectByID(projectID)
+	if err != nil {
+		return visualProjectSummary{}, err
+	}
+
+	stats, err := s.projectStats(project.Project)
+	if err != nil {
+		return visualProjectSummary{}, err
+	}
+
+	return visualProjectSummary{
+		ID:        project.Project.ID,
+		Name:      project.Project.Name,
+		TargetURL: project.Project.TargetURL,
+		CreatedAt: project.Project.CreatedAt,
+		UpdatedAt: project.Project.UpdatedAt,
+		Stats:     stats,
+	}, nil
+}
+
+func (s server) projectStats(project visualProject) (visualProjectStats, error) {
+	ctx := s.projectContext(project)
+	stats := visualProjectStats{LatestStatus: statusBaseline}
+
+	pagesManifest, err := s.readVisualPagesManifest(ctx)
+	if err == nil {
+		stats.TotalSections = len(pagesManifest.Pages)
+	}
+
+	history, err := readJSON[visualHistory](filepath.Join(ctx.ResultsDir, "history.json"))
+	if err != nil {
+		if latestManifest, manifestErr := readJSON[revisionManifest](filepath.Join(ctx.ResultsDir, "manifest.json")); manifestErr == nil {
+			stats.LatestStatus = latestManifest.Status
+			stats.ChangedPages = latestManifest.ChangedPages
+			stats.LastScanTime = latestManifest.CreatedAt
+			stats.TotalRevisions = 1
+		}
+		return stats, nil
+	}
+
+	stats.TotalRevisions = len(history.Revisions)
+	latestRevisionID := history.LatestRevisionID
+	for index, revision := range history.Revisions {
+		if (latestRevisionID == "" && index == 0) || revision.ID == latestRevisionID {
+			stats.LatestStatus = revision.Status
+			stats.ChangedPages = revision.ChangedPages
+			stats.LastScanTime = revision.CreatedAt
+			break
+		}
+	}
+
+	return stats, nil
+}
+
+func (s server) createProject(w http.ResponseWriter, r *http.Request) (visualProjectSummary, error) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	defer r.Body.Close()
+
+	var request struct {
+		Name      string `json:"name"`
+		TargetURL string `json:"targetUrl"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		return visualProjectSummary{}, fmt.Errorf("Project details must be valid JSON.")
+	}
+
+	name := strings.TrimSpace(request.Name)
+	targetURL := strings.TrimSpace(request.TargetURL)
+	if name == "" {
+		return visualProjectSummary{}, fmt.Errorf("Project name is required.")
+	}
+	if targetURL == "" {
+		return visualProjectSummary{}, fmt.Errorf("Target URL is required.")
+	}
+
+	parsedURL, err := url.Parse(targetURL)
+	if err != nil || !parsedURL.IsAbs() || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
+		return visualProjectSummary{}, fmt.Errorf("Target URL must be an HTTP or HTTPS URL.")
+	}
+	parsedURL.Fragment = ""
+
+	registry, err := s.ensureProjectRegistry()
+	if err != nil {
+		return visualProjectSummary{}, fmt.Errorf("Could not read visual projects.")
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	project := visualProject{
+		ID:        uniqueProjectID(slugProjectID(name), registry.Projects),
+		Name:      name,
+		TargetURL: parsedURL.String(),
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	registry.Projects = append(registry.Projects, project)
+	if registry.DefaultProjectID == "" {
+		registry.DefaultProjectID = project.ID
+	}
+	if registry.Version == 0 {
+		registry.Version = 1
+	}
+
+	if err := writeJSONFile(s.projectRegistryPath(), registry); err != nil {
+		return visualProjectSummary{}, fmt.Errorf("Could not save the new visual project.")
+	}
+	if err := s.ensureProjectStorage(project); err != nil {
+		return visualProjectSummary{}, fmt.Errorf("Could not initialize the new visual project.")
+	}
+
+	return s.projectSummary(project.ID)
+}
+
+func (s server) ensureProjectRegistry() (visualProjectRegistry, error) {
+	registryPath := s.projectRegistryPath()
+	registry, err := readJSON[visualProjectRegistry](registryPath)
+	shouldWrite := false
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return visualProjectRegistry{}, err
+		}
+
+		legacyManifest, _ := s.readLegacyVisualPagesManifest()
+		generatedAt := legacyManifest.GeneratedAt
+		if generatedAt == "" {
+			generatedAt = now
+		}
+		targetURL := legacyManifest.TargetURL
+		if targetURL == "" {
+			targetURL = defaultTargetURL
+		}
+
+		registry = visualProjectRegistry{
+			Version:          1,
+			DefaultProjectID: defaultProjectID,
+			Projects: []visualProject{{
+				ID:        defaultProjectID,
+				Name:      defaultProjectName,
+				TargetURL: targetURL,
+				CreatedAt: generatedAt,
+				UpdatedAt: generatedAt,
+			}},
+		}
+		shouldWrite = true
+	}
+
+	if registry.Version == 0 {
+		registry.Version = 1
+		shouldWrite = true
+	}
+	if registry.DefaultProjectID == "" && len(registry.Projects) > 0 {
+		registry.DefaultProjectID = registry.Projects[0].ID
+		shouldWrite = true
+	}
+
+	hasDefaultProject := false
+	for index := range registry.Projects {
+		project := &registry.Projects[index]
+		if project.ID == defaultProjectID {
+			hasDefaultProject = true
+		}
+		if project.Name == "" {
+			project.Name = project.ID
+			shouldWrite = true
+		}
+		if project.TargetURL == "" {
+			project.TargetURL = defaultTargetURL
+			shouldWrite = true
+		}
+		if project.CreatedAt == "" {
+			project.CreatedAt = now
+			shouldWrite = true
+		}
+		if project.UpdatedAt == "" {
+			project.UpdatedAt = project.CreatedAt
+			shouldWrite = true
+		}
+	}
+
+	if !hasDefaultProject {
+		legacyManifest, _ := s.readLegacyVisualPagesManifest()
+		generatedAt := legacyManifest.GeneratedAt
+		if generatedAt == "" {
+			generatedAt = now
+		}
+		targetURL := legacyManifest.TargetURL
+		if targetURL == "" {
+			targetURL = defaultTargetURL
+		}
+		registry.Projects = append([]visualProject{{
+			ID:        defaultProjectID,
+			Name:      defaultProjectName,
+			TargetURL: targetURL,
+			CreatedAt: generatedAt,
+			UpdatedAt: generatedAt,
+		}}, registry.Projects...)
+		if registry.DefaultProjectID == "" {
+			registry.DefaultProjectID = defaultProjectID
+		}
+		shouldWrite = true
+	}
+
+	if shouldWrite {
+		if err := writeJSONFile(registryPath, registry); err != nil {
+			return visualProjectRegistry{}, err
+		}
+	}
+
+	for _, project := range registry.Projects {
+		if err := s.ensureProjectStorage(project); err != nil {
+			return visualProjectRegistry{}, err
+		}
+	}
+
+	return registry, nil
+}
+
+func (s server) ensureProjectStorage(project visualProject) error {
+	ctx := s.projectContext(project)
+	if err := os.MkdirAll(ctx.SnapshotDir, 0o755); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(ctx.ResultsDir, 0o755); err != nil {
+		return err
+	}
+
+	if project.ID == defaultProjectID {
+		return s.migrateLegacyDefaultProject(project)
+	}
+
+	if !fileExists(ctx.VisualPagesPath) {
+		return writeJSONFile(ctx.VisualPagesPath, visualPagesManifest{
+			Version:     1,
+			TargetURL:   project.TargetURL,
+			GeneratedAt: time.Now().UTC().Format(time.RFC3339Nano),
+			Pages:       []visualPage{},
+		})
+	}
+
+	return nil
+}
+
+func (s server) migrateLegacyDefaultProject(project visualProject) error {
+	ctx := s.projectContext(project)
+	if !fileExists(ctx.VisualPagesPath) {
+		legacyManifest, err := s.readLegacyVisualPagesManifest()
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if err := writeJSONFile(ctx.VisualPagesPath, rewriteVisualPagesManifest(project, legacyManifest)); err != nil {
+			return err
+		}
+	}
+
+	legacySnapshotDir := filepath.Join(s.rootDir, "tests", "visual-test-sample.spec.ts-snapshots")
+	if entries, err := os.ReadDir(legacySnapshotDir); err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			sourcePath := filepath.Join(legacySnapshotDir, entry.Name())
+			destinationPath := filepath.Join(ctx.SnapshotDir, entry.Name())
+			if !fileExists(destinationPath) {
+				if err := copyFile(sourcePath, destinationPath); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	legacyResultsDir := filepath.Join(s.rootDir, "public", "visual-results")
+	if !fileExists(filepath.Join(ctx.ResultsDir, "history.json")) && fileExists(legacyResultsDir) {
+		if err := s.copyLegacyResults(legacyResultsDir, ctx.ResultsDir, project.ID); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (s server) readLegacyVisualPagesManifest() (visualPagesManifest, error) {
+	manifest, err := readJSON[visualPagesManifest](filepath.Join(s.rootDir, "tests", "visual-pages.json"))
+	if err != nil {
+		return visualPagesManifest{
+			Version:     1,
+			TargetURL:   defaultTargetURL,
+			GeneratedAt: time.Now().UTC().Format(time.RFC3339Nano),
+			Pages:       []visualPage{},
+		}, err
+	}
+	return manifest, nil
+}
+
+func rewriteVisualPagesManifest(project visualProject, manifest visualPagesManifest) visualPagesManifest {
+	if manifest.Version == 0 {
+		manifest.Version = 1
+	}
+	if manifest.TargetURL == "" {
+		manifest.TargetURL = project.TargetURL
+	}
+	if manifest.GeneratedAt == "" {
+		manifest.GeneratedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+
+	for index := range manifest.Pages {
+		page := &manifest.Pages[index]
+		if page.BaselineFileName == "" {
+			page.BaselineFileName = makeBaselineFileName(page.ID)
+		}
+		page.BaselineImageURL = projectBaselineImageURL(project.ID, page.BaselineFileName)
+		page.SnapshotPath = projectSnapshotPath(project.ID, page.BaselineFileName)
+	}
+
+	return manifest
+}
+
+func (s server) copyLegacyResults(sourceDir string, destinationDir string, projectID string) error {
+	entries, err := os.ReadDir(sourceDir)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(destinationDir, 0o755); err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		if entry.Name() == projectID {
+			continue
+		}
+
+		sourcePath := filepath.Join(sourceDir, entry.Name())
+		destinationPath := filepath.Join(destinationDir, entry.Name())
+		if entry.IsDir() {
+			if err := s.copyTreeRewriteJSON(sourcePath, destinationPath, projectID); err != nil {
+				return err
+			}
+			continue
+		}
+		if strings.HasSuffix(entry.Name(), ".json") {
+			if err := rewriteProjectJSONFile(sourcePath, destinationPath, projectID); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := copyFile(sourcePath, destinationPath); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (s server) copyTreeRewriteJSON(sourceDir string, destinationDir string, projectID string) error {
+	entries, err := os.ReadDir(sourceDir)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(destinationDir, 0o755); err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		sourcePath := filepath.Join(sourceDir, entry.Name())
+		destinationPath := filepath.Join(destinationDir, entry.Name())
+		if entry.IsDir() {
+			if err := s.copyTreeRewriteJSON(sourcePath, destinationPath, projectID); err != nil {
+				return err
+			}
+			continue
+		}
+		if strings.HasSuffix(entry.Name(), ".json") {
+			if err := rewriteProjectJSONFile(sourcePath, destinationPath, projectID); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := copyFile(sourcePath, destinationPath); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func rewriteProjectJSONFile(sourcePath string, destinationPath string, projectID string) error {
+	value, err := readJSON[any](sourcePath)
+	if err != nil {
+		return err
+	}
+	return writeJSONFile(destinationPath, rewriteProjectReferences(value, projectID))
+}
+
+func rewriteProjectReferences(value any, projectID string) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, item := range typed {
+			typed[key] = rewriteProjectReferences(item, projectID)
+		}
+		return typed
+	case []any:
+		for index, item := range typed {
+			typed[index] = rewriteProjectReferences(item, projectID)
+		}
+		return typed
+	case string:
+		return rewriteProjectString(typed, projectID)
+	default:
+		return value
+	}
+}
+
+func rewriteProjectString(value string, projectID string) string {
+	value = strings.ReplaceAll(value, "/assets/baselines/visual-test-sample/", "/assets/baselines/"+projectID+"/")
+	value = strings.ReplaceAll(value, "tests/visual-test-sample.spec.ts-snapshots/", filepath.ToSlash(projectSnapshotDir(projectID))+"/")
+
+	visualResultsPrefix := "/visual-results/"
+	if strings.HasPrefix(value, visualResultsPrefix) && !strings.HasPrefix(value, visualResultsPrefix+projectID+"/") {
+		value = visualResultsPrefix + projectID + "/" + strings.TrimPrefix(value, visualResultsPrefix)
+	}
+
+	publicResultsPrefix := "public/visual-results/"
+	if strings.HasPrefix(value, publicResultsPrefix) && !strings.HasPrefix(value, publicResultsPrefix+projectID+"/") {
+		value = publicResultsPrefix + projectID + "/" + strings.TrimPrefix(value, publicResultsPrefix)
+	}
+
+	return value
+}
+
+func (s server) projectContext(project visualProject) projectContext {
+	projectDir := filepath.Join(s.rootDir, "tests", "visual-projects", project.ID)
+	return projectContext{
+		Project:         project,
+		VisualPagesPath: filepath.Join(projectDir, "visual-pages.json"),
+		SnapshotDir:     filepath.Join(projectDir, "snapshots"),
+		ResultsDir:      filepath.Join(s.rootDir, "public", "visual-results", project.ID),
+	}
+}
+
+func (s server) projectRegistryPath() string {
+	return filepath.Join(s.rootDir, "tests", "visual-projects.json")
+}
+
+func (s server) projectSnapshotDir(projectID string) string {
+	return filepath.Join(s.rootDir, projectSnapshotDir(projectID))
+}
+
+func projectSnapshotDir(projectID string) string {
+	return filepath.Join("tests", "visual-projects", projectID, "snapshots")
+}
+
+func projectSnapshotPath(projectID string, fileName string) string {
+	return filepath.ToSlash(filepath.Join(projectSnapshotDir(projectID), fileName))
+}
+
+func projectBaselineImageURL(projectID string, fileName string) string {
+	return "/assets/baselines/" + projectID + "/" + fileName
+}
+
+func projectRevisionManifestURL(projectID string, revisionID string) string {
+	return "/visual-results/" + projectID + "/revisions/" + revisionID + "/manifest.json"
+}
+
+func validProjectID(projectID string) bool {
+	return projectID != "" && !strings.Contains(projectID, "/") && !strings.Contains(projectID, "\\") && !strings.Contains(projectID, "..")
+}
+
+func slugProjectID(value string) string {
+	var builder strings.Builder
+	previousHyphen := false
+
+	for _, character := range strings.ToLower(value) {
+		if unicode.IsLetter(character) || unicode.IsDigit(character) {
+			builder.WriteRune(character)
+			previousHyphen = false
+			continue
+		}
+		if !previousHyphen {
+			builder.WriteByte('-')
+			previousHyphen = true
+		}
+	}
+
+	slug := strings.Trim(builder.String(), "-")
+	if slug == "" {
+		return "visual-project"
+	}
+	return slug
+}
+
+func uniqueProjectID(baseID string, projects []visualProject) string {
+	usedIDs := make(map[string]bool, len(projects))
+	for _, project := range projects {
+		usedIDs[project.ID] = true
+	}
+	if !usedIDs[baseID] {
+		return baseID
+	}
+	for index := 2; ; index++ {
+		candidate := fmt.Sprintf("%s-%d", baseID, index)
+		if !usedIDs[candidate] {
+			return candidate
+		}
+	}
+}
+
+func fileExists(filePath string) bool {
+	_, err := os.Stat(filePath)
+	return err == nil
+}
+
+func (s server) addVisualSection(w http.ResponseWriter, r *http.Request, project projectContext) (sectionResponse, error) {
 	name, pageURL, imageBytes, err := readSectionUpload(w, r)
 	if err != nil {
 		return sectionResponse{}, err
 	}
 
-	pagesManifest, err := s.readVisualPagesManifest()
+	pagesManifest, err := s.readVisualPagesManifest(project)
 	if err != nil {
 		return sectionResponse{}, fmt.Errorf("Could not read visual sections.")
 	}
@@ -442,12 +1288,12 @@ func (s server) addVisualSection(w http.ResponseWriter, r *http.Request) (sectio
 		URL:              resolvedURL,
 		SnapshotName:     sectionID + ".png",
 		BaselineFileName: baselineFileName,
-		BaselineImageURL: "/assets/baselines/visual-test-sample/" + baselineFileName,
-		SnapshotPath:     "tests/visual-test-sample.spec.ts-snapshots/" + baselineFileName,
+		BaselineImageURL: projectBaselineImageURL(project.Project.ID, baselineFileName),
+		SnapshotPath:     projectSnapshotPath(project.Project.ID, baselineFileName),
 		ManualBaseline:   true,
 	}
 
-	destinationPath := filepath.Join(s.snapshotDir, baselineFileName)
+	destinationPath := filepath.Join(project.SnapshotDir, baselineFileName)
 	if err := writeFileAtomic(destinationPath, imageBytes); err != nil {
 		return sectionResponse{}, fmt.Errorf("Could not save the uploaded baseline image.")
 	}
@@ -459,28 +1305,78 @@ func (s server) addVisualSection(w http.ResponseWriter, r *http.Request) (sectio
 		pagesManifest.Version = 1
 	}
 	if pagesManifest.TargetURL == "" {
-		pagesManifest.TargetURL = defaultTargetURL
+		pagesManifest.TargetURL = project.Project.TargetURL
 	}
 
-	if err := s.writeVisualPagesManifest(pagesManifest); err != nil {
+	if err := s.writeVisualPagesManifest(project, pagesManifest); err != nil {
 		return sectionResponse{}, fmt.Errorf("Could not register the uploaded visual section.")
 	}
 
-	manifest := s.visualPagesToManifest(pagesManifest)
+	manifest := s.visualPagesToManifest(project, pagesManifest)
 	return sectionResponse{
 		Message:  "Section added. Run a visual scan to compare it against the uploaded baseline.",
-		Section:  visualPageToItem(section, pagesManifest.GeneratedAt),
+		Section:  visualPageToItem(project.Project, section, pagesManifest.GeneratedAt),
 		Manifest: manifest,
 	}, nil
 }
 
-func (s server) updateVisualSectionBaseline(w http.ResponseWriter, r *http.Request, sectionID string) (sectionResponse, error) {
+func (s server) updateVisualSectionDetails(w http.ResponseWriter, r *http.Request, project projectContext, sectionID string) (sectionResponse, error) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	defer r.Body.Close()
+
+	var request struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		return sectionResponse{}, fmt.Errorf("Section details must be valid JSON.")
+	}
+
+	name := strings.TrimSpace(request.Name)
+	if name == "" {
+		return sectionResponse{}, fmt.Errorf("Section name is required.")
+	}
+
+	pagesManifest, err := s.readVisualPagesManifest(project)
+	if err != nil {
+		return sectionResponse{}, fmt.Errorf("Could not read visual sections.")
+	}
+
+	sectionIndex := -1
+	for index, section := range pagesManifest.Pages {
+		if section.ID == sectionID {
+			sectionIndex = index
+			break
+		}
+	}
+
+	if sectionIndex == -1 {
+		return sectionResponse{}, fmt.Errorf("The selected section could not be found.")
+	}
+
+	section := pagesManifest.Pages[sectionIndex]
+	section.Name = name
+	pagesManifest.GeneratedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	pagesManifest.Pages[sectionIndex] = section
+
+	if err := s.writeVisualPagesManifest(project, pagesManifest); err != nil {
+		return sectionResponse{}, fmt.Errorf("Could not update the selected section.")
+	}
+
+	manifest := s.visualPagesToManifest(project, pagesManifest)
+	return sectionResponse{
+		Message:  "Section renamed.",
+		Section:  visualPageToItem(project.Project, section, pagesManifest.GeneratedAt),
+		Manifest: manifest,
+	}, nil
+}
+
+func (s server) updateVisualSectionBaseline(w http.ResponseWriter, r *http.Request, project projectContext, sectionID string) (sectionResponse, error) {
 	imageBytes, err := readBaselineImageUpload(w, r)
 	if err != nil {
 		return sectionResponse{}, err
 	}
 
-	pagesManifest, err := s.readVisualPagesManifest()
+	pagesManifest, err := s.readVisualPagesManifest(project)
 	if err != nil {
 		return sectionResponse{}, fmt.Errorf("Could not read visual sections.")
 	}
@@ -502,13 +1398,13 @@ func (s server) updateVisualSectionBaseline(w http.ResponseWriter, r *http.Reque
 		section.BaselineFileName = makeBaselineFileName(section.ID)
 	}
 	if section.SnapshotPath == "" {
-		section.SnapshotPath = "tests/visual-test-sample.spec.ts-snapshots/" + section.BaselineFileName
+		section.SnapshotPath = projectSnapshotPath(project.Project.ID, section.BaselineFileName)
 	}
 	if section.BaselineImageURL == "" {
-		section.BaselineImageURL = "/assets/baselines/visual-test-sample/" + section.BaselineFileName
+		section.BaselineImageURL = projectBaselineImageURL(project.Project.ID, section.BaselineFileName)
 	}
 
-	destinationPath := filepath.Join(s.snapshotDir, section.BaselineFileName)
+	destinationPath := filepath.Join(project.SnapshotDir, section.BaselineFileName)
 	if err := writeFileAtomic(destinationPath, imageBytes); err != nil {
 		return sectionResponse{}, fmt.Errorf("Could not replace the baseline image.")
 	}
@@ -518,16 +1414,79 @@ func (s server) updateVisualSectionBaseline(w http.ResponseWriter, r *http.Reque
 	pagesManifest.GeneratedAt = now
 	pagesManifest.Pages[sectionIndex] = section
 
-	if err := s.writeVisualPagesManifest(pagesManifest); err != nil {
+	if err := s.writeVisualPagesManifest(project, pagesManifest); err != nil {
 		return sectionResponse{}, fmt.Errorf("Could not update the selected section.")
 	}
 
-	manifest := s.visualPagesToManifest(pagesManifest)
+	manifest := s.visualPagesToManifest(project, pagesManifest)
 	return sectionResponse{
 		Message:  "Baseline image updated. Future visual scans will compare against this uploaded image.",
-		Section:  visualPageToItem(section, pagesManifest.GeneratedAt),
+		Section:  visualPageToItem(project.Project, section, pagesManifest.GeneratedAt),
 		Manifest: manifest,
 	}, nil
+}
+
+func (s server) deleteVisualSection(project projectContext, sectionID string) (sectionDeleteResponse, error) {
+	pagesManifest, err := s.readVisualPagesManifest(project)
+	if err != nil {
+		return sectionDeleteResponse{}, fmt.Errorf("Could not read visual sections.")
+	}
+
+	if len(pagesManifest.Pages) <= 1 {
+		return sectionDeleteResponse{}, fmt.Errorf("At least one visual section is required.")
+	}
+
+	sectionIndex := -1
+	for index, section := range pagesManifest.Pages {
+		if section.ID == sectionID {
+			sectionIndex = index
+			break
+		}
+	}
+
+	if sectionIndex == -1 {
+		return sectionDeleteResponse{}, fmt.Errorf("The selected section could not be found.")
+	}
+
+	removedSection := pagesManifest.Pages[sectionIndex]
+	pagesManifest.Pages = append(pagesManifest.Pages[:sectionIndex], pagesManifest.Pages[sectionIndex+1:]...)
+	pagesManifest.GeneratedAt = time.Now().UTC().Format(time.RFC3339Nano)
+
+	if err := s.writeVisualPagesManifest(project, pagesManifest); err != nil {
+		return sectionDeleteResponse{}, fmt.Errorf("Could not remove the selected section.")
+	}
+
+	if removedSection.ManualBaseline && removedSection.BaselineFileName != "" {
+		_ = os.Remove(filepath.Join(project.SnapshotDir, removedSection.BaselineFileName))
+	}
+
+	return sectionDeleteResponse{
+		Message:  "Section removed.",
+		Manifest: s.visualPagesToManifest(project, pagesManifest),
+	}, nil
+}
+
+func readSectionRefreshRequest(w http.ResponseWriter, r *http.Request) (bool, error) {
+	update := r.URL.Query().Get("update") == "true" || r.URL.Query().Get("update") == "1"
+
+	if r.Body == nil || r.ContentLength == 0 {
+		return update, nil
+	}
+	defer r.Body.Close()
+
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+
+	var request struct {
+		Update *bool `json:"update"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil && !errors.Is(err, io.EOF) {
+		return false, fmt.Errorf("Refresh options must be valid JSON.")
+	}
+	if request.Update != nil {
+		update = *request.Update
+	}
+
+	return update, nil
 }
 
 func readSectionUpload(w http.ResponseWriter, r *http.Request) (string, string, []byte, error) {
@@ -675,16 +1634,16 @@ func makeBaselineFileName(sectionID string) string {
 	return fmt.Sprintf("%s-chromium-%s.png", sectionID, runtime.GOOS)
 }
 
-func (s server) acceptOneRevisionItem(revisionID string, itemID string) (acceptResponse, error) {
-	return s.acceptRevisionItems(revisionID, map[string]bool{itemID: true}, false)
+func (s server) acceptOneRevisionItem(project projectContext, revisionID string, itemID string) (acceptResponse, error) {
+	return s.acceptRevisionItems(project, revisionID, map[string]bool{itemID: true}, false)
 }
 
-func (s server) acceptAllRevisionItems(revisionID string) (acceptResponse, error) {
-	return s.acceptRevisionItems(revisionID, nil, true)
+func (s server) acceptAllRevisionItems(project projectContext, revisionID string) (acceptResponse, error) {
+	return s.acceptRevisionItems(project, revisionID, nil, true)
 }
 
-func (s server) acceptRevisionItems(revisionID string, acceptedItemIDs map[string]bool, acceptAll bool) (acceptResponse, error) {
-	manifestPath := filepath.Join(s.visualResultsDir, "revisions", revisionID, "manifest.json")
+func (s server) acceptRevisionItems(project projectContext, revisionID string, acceptedItemIDs map[string]bool, acceptAll bool) (acceptResponse, error) {
+	manifestPath := filepath.Join(project.ResultsDir, "revisions", revisionID, "manifest.json")
 	manifest, err := readJSON[revisionManifest](manifestPath)
 	if err != nil {
 		return acceptResponse{}, fmt.Errorf("Could not read the selected visual revision.")
@@ -715,7 +1674,7 @@ func (s server) acceptRevisionItems(revisionID string, acceptedItemIDs map[strin
 		}
 
 		destinationPath, err := s.safeRepoPath(item.SnapshotPath)
-		if err != nil || !isInside(s.snapshotDir, destinationPath) {
+		if err != nil || !isInside(project.SnapshotDir, destinationPath) {
 			return acceptResponse{}, fmt.Errorf("%s has an invalid baseline screenshot path.", item.Name)
 		}
 
@@ -744,16 +1703,16 @@ func (s server) acceptRevisionItems(revisionID string, acceptedItemIDs map[strin
 		return acceptResponse{}, fmt.Errorf("Could not update the accepted visual revision.")
 	}
 
-	history, err := s.updateHistoryForRevision(manifest)
+	history, err := s.updateHistoryForRevision(project, manifest)
 	if err != nil {
 		return acceptResponse{}, err
 	}
 
-	latestManifestPath := filepath.Join(s.visualResultsDir, "manifest.json")
+	latestManifestPath := filepath.Join(project.ResultsDir, "manifest.json")
 	latestManifest, err := readJSON[revisionManifest](latestManifestPath)
 	if err == nil && latestManifest.RevisionID == revisionID {
 		manifest.LatestRevisionID = revisionID
-		manifest.LatestManifestURL = "/visual-results/revisions/" + revisionID + "/manifest.json"
+		manifest.LatestManifestURL = projectRevisionManifestURL(project.Project.ID, revisionID)
 		if err := writeJSONFile(latestManifestPath, manifest); err != nil {
 			return acceptResponse{}, fmt.Errorf("Could not update the latest visual revision.")
 		}
@@ -795,8 +1754,8 @@ func refreshManifestCounts(manifest *revisionManifest) {
 	manifest.Label = labelWithStatus(manifest.CreatedAt, manifest.Status)
 }
 
-func (s server) updateHistoryForRevision(manifest revisionManifest) (visualHistory, error) {
-	historyPath := filepath.Join(s.visualResultsDir, "history.json")
+func (s server) updateHistoryForRevision(project projectContext, manifest revisionManifest) (visualHistory, error) {
+	historyPath := filepath.Join(project.ResultsDir, "history.json")
 	history, err := readJSON[visualHistory](historyPath)
 	if err != nil {
 		return visualHistory{}, fmt.Errorf("Could not read visual revision history.")
@@ -821,14 +1780,13 @@ func (s server) updateHistoryForRevision(manifest revisionManifest) (visualHisto
 	return history, nil
 }
 
-func (s server) readVisualPagesManifest() (visualPagesManifest, error) {
-	manifestPath := filepath.Join(s.rootDir, "tests", "visual-pages.json")
-	manifest, err := readJSON[visualPagesManifest](manifestPath)
+func (s server) readVisualPagesManifest(project projectContext) (visualPagesManifest, error) {
+	manifest, err := readJSON[visualPagesManifest](project.VisualPagesPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return visualPagesManifest{
 				Version:     1,
-				TargetURL:   defaultTargetURL,
+				TargetURL:   project.Project.TargetURL,
 				GeneratedAt: time.Now().UTC().Format(time.RFC3339Nano),
 				Pages:       []visualPage{},
 			}, nil
@@ -841,20 +1799,20 @@ func (s server) readVisualPagesManifest() (visualPagesManifest, error) {
 		manifest.Version = 1
 	}
 	if manifest.TargetURL == "" {
-		manifest.TargetURL = defaultTargetURL
+		manifest.TargetURL = project.Project.TargetURL
 	}
 
 	return manifest, nil
 }
 
-func (s server) writeVisualPagesManifest(manifest visualPagesManifest) error {
-	return writeJSONFile(filepath.Join(s.rootDir, "tests", "visual-pages.json"), manifest)
+func (s server) writeVisualPagesManifest(project projectContext, manifest visualPagesManifest) error {
+	return writeJSONFile(project.VisualPagesPath, manifest)
 }
 
-func (s server) visualPagesToManifest(pagesManifest visualPagesManifest) revisionManifest {
+func (s server) visualPagesToManifest(project projectContext, pagesManifest visualPagesManifest) revisionManifest {
 	items := make([]visualItem, 0, len(pagesManifest.Pages))
 	for _, page := range pagesManifest.Pages {
-		items = append(items, visualPageToItem(page, pagesManifest.GeneratedAt))
+		items = append(items, visualPageToItem(project.Project, page, pagesManifest.GeneratedAt))
 	}
 
 	generatedAt := pagesManifest.GeneratedAt
@@ -874,7 +1832,7 @@ func (s server) visualPagesToManifest(pagesManifest visualPagesManifest) revisio
 	}
 }
 
-func visualPageToItem(page visualPage, generatedAt string) visualItem {
+func visualPageToItem(project visualProject, page visualPage, generatedAt string) visualItem {
 	if generatedAt == "" {
 		generatedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	}
@@ -886,18 +1844,18 @@ func visualPageToItem(page visualPage, generatedAt string) visualItem {
 
 	snapshotPath := page.SnapshotPath
 	if snapshotPath == "" {
-		snapshotPath = "tests/visual-test-sample.spec.ts-snapshots/" + baselineFileName
+		snapshotPath = projectSnapshotPath(project.ID, baselineFileName)
 	}
 
 	baselineImageURL := page.BaselineImageURL
 	if baselineImageURL == "" {
-		baselineImageURL = "/assets/baselines/visual-test-sample/" + baselineFileName
+		baselineImageURL = projectBaselineImageURL(project.ID, baselineFileName)
 	}
 
 	return visualItem{
 		ID:               page.ID,
 		Name:             page.Name,
-		Source:           "Visual Test Sample",
+		Source:           project.Name,
 		TargetURL:        page.URL,
 		Browser:          "Chromium",
 		Viewport:         "1440 x 900",

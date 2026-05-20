@@ -1,7 +1,8 @@
 import { Component, OnDestroy, OnInit, computed, signal } from '@angular/core';
 
 type VisualStatus = 'baseline' | 'clean' | 'changed' | 'accepted';
-type DashboardPage = 'dashboard' | 'history';
+type DashboardPage = 'projects' | 'dashboard' | 'snapshots';
+type VisualJob = 'visual-scan' | 'section-scan' | 'refresh-sections' | 'update-baselines';
 
 type VisualBaseline = {
   readonly id: string;
@@ -57,6 +58,28 @@ type VisualHistory = {
   readonly revisions: readonly VisualRevision[];
 };
 
+type VisualProjectStats = {
+  readonly latestStatus: VisualStatus;
+  readonly changedPages: number;
+  readonly totalSections: number;
+  readonly lastScanTime?: string;
+  readonly totalRevisions: number;
+};
+
+type VisualProject = {
+  readonly id: string;
+  readonly name: string;
+  readonly targetUrl: string;
+  readonly createdAt?: string;
+  readonly updatedAt?: string;
+  readonly stats: VisualProjectStats;
+};
+
+type ProjectsResponse = {
+  readonly defaultProjectId: string;
+  readonly projects: readonly VisualProject[];
+};
+
 type AcceptRevisionResponse = {
   readonly message: string;
   readonly history: VisualHistory;
@@ -77,25 +100,15 @@ type SectionResponse = {
   readonly manifest: VisualManifest;
 };
 
-const DEFAULT_BASELINES: readonly VisualBaseline[] = [
-  {
-    id: 'home-page',
-    name: 'Home Page',
-    source: 'Visual Test Sample',
-    targetUrl: 'https://visual-test-sample.vercel.app/',
-    browser: 'Chromium',
-    viewport: '1440 x 900',
-    status: 'baseline',
-    generatedAt: null,
-    baselineImageUrl: '/assets/baselines/visual-test-sample/home-page-chromium-darwin.png',
-    actualImageUrl: null,
-    diffImageUrl: null,
-    snapshotPath: 'tests/visual-test-sample.spec.ts-snapshots/home-page-chromium-darwin.png',
-    actualPath: null,
-    diffPath: null,
-    errorContextPath: null,
-  },
-];
+type SectionRefreshResponse = {
+  readonly message: string;
+  readonly manifest: VisualManifest;
+};
+
+type SectionDeleteResponse = {
+  readonly message: string;
+  readonly manifest: VisualManifest;
+};
 
 @Component({
   selector: 'app-root',
@@ -105,8 +118,15 @@ const DEFAULT_BASELINES: readonly VisualBaseline[] = [
 })
 export class AppComponent implements OnInit, OnDestroy {
   readonly currentPage = signal<DashboardPage>(this.pageFromLocation());
-  readonly baselines = signal(DEFAULT_BASELINES);
-  readonly selectedBaselineId = signal(DEFAULT_BASELINES[0].id);
+  readonly projects = signal<readonly VisualProject[]>([]);
+  readonly defaultProjectId = signal('');
+  readonly selectedProjectId = signal(this.projectIdFromLocation());
+  readonly loadingProjects = signal(true);
+  readonly creatingProject = signal(false);
+  readonly projectMessage = signal<string | null>(null);
+  readonly projectError = signal<string | null>(null);
+  readonly baselines = signal<readonly VisualBaseline[]>([]);
+  readonly selectedBaselineId = signal('');
   readonly revisions = signal<readonly VisualRevision[]>([]);
   readonly selectedRevisionId = signal('');
   readonly revisionManifests = signal<Record<string, VisualManifest>>({});
@@ -116,45 +136,182 @@ export class AppComponent implements OnInit, OnDestroy {
   readonly acceptMessage = signal<string | null>(null);
   readonly acceptError = signal<string | null>(null);
   readonly scanning = signal(false);
+  readonly runningJob = signal<VisualJob | null>(null);
   readonly scanMessage = signal<string | null>(null);
   readonly scanError = signal<string | null>(null);
   readonly cancelingScan = signal(false);
   readonly sectionFormOpen = signal(false);
+  readonly editingSections = signal(false);
   readonly addingSection = signal(false);
+  readonly updatingSection = signal(false);
   readonly updatingBaseline = signal(false);
+  readonly removingSectionId = signal('');
   readonly selectedSectionImageName = signal('');
   readonly selectedBaselineImageName = signal('');
   readonly sectionMessage = signal<string | null>(null);
   readonly sectionError = signal<string | null>(null);
+  readonly sectionSettingsId = signal('');
+  readonly reportOpen = signal(true);
   readonly imageVersion = signal('');
 
-  readonly selectedBaseline = computed(() => {
-    return this.baselines().find((baseline) => baseline.id === this.selectedBaselineId()) ?? DEFAULT_BASELINES[0];
+  readonly selectedBaseline = computed<VisualBaseline | null>(() => {
+    return this.baselines().find((baseline) => baseline.id === this.selectedBaselineId()) ?? this.baselines().at(0) ?? null;
+  });
+
+  readonly selectedProject = computed(() => {
+    return this.projects().find((project) => project.id === this.selectedProjectId()) ?? null;
   });
 
   readonly selectedRevision = computed(() => {
     return this.revisions().find((revision) => revision.id === this.selectedRevisionId()) ?? null;
   });
 
+  readonly sectionSettingsBaseline = computed(() => {
+    const settingsId = this.sectionSettingsId();
+    return settingsId ? this.baselines().find((baseline) => baseline.id === settingsId) ?? null : null;
+  });
+
   readonly pageEyebrow = computed(() => {
-    return this.currentPage() === 'history' ? 'Reports / History' : 'Visual Regression';
+    if (this.currentPage() === 'snapshots') {
+      return 'Snapshots';
+    }
+
+    return `${this.selectedProject()?.name ?? 'Project'} · Visual Regression`;
   });
 
   readonly pageHeading = computed(() => {
-    return this.currentPage() === 'history' ? 'Visual Reports and Snapshot History' : '';
+    return this.currentPage() === 'snapshots' ? 'Snapshots' : '';
   });
+
+  readonly refreshingSections = computed(() => this.runningJob() === 'refresh-sections');
+  readonly updatingGeneratedBaselines = computed(() => this.runningJob() === 'update-baselines');
 
   private scanAbortController: AbortController | null = null;
 
   private readonly handlePopState = (): void => {
     this.currentPage.set(this.pageFromLocation());
+    const projectId = this.projectIdFromLocation();
+    if (projectId) {
+      this.selectedProjectId.set(projectId);
+    }
+    if (this.currentPage() !== 'projects') {
+      void this.loadProjectVisualData();
+    }
   };
 
   async ngOnInit(): Promise<void> {
     window.addEventListener('popstate', this.handlePopState);
+    await this.loadProjects();
+
+    if (this.currentPage() === 'projects') {
+      return;
+    }
+
+    await this.loadProjectVisualData();
+  }
+
+  ngOnDestroy(): void {
+    this.scanAbortController?.abort();
+    window.removeEventListener('popstate', this.handlePopState);
+  }
+
+  async loadProjects(): Promise<void> {
+    this.loadingProjects.set(true);
+    this.projectError.set(null);
 
     try {
-      const history = await this.fetchJson<VisualHistory>('/visual-results/history.json');
+      const response = await this.fetchJson<ProjectsResponse>('/api/projects');
+      if (!response) {
+        throw new Error('Could not load visual projects.');
+      }
+      const projects = response?.projects ?? [];
+      this.projects.set(projects);
+      this.defaultProjectId.set(response?.defaultProjectId ?? projects[0]?.id ?? '');
+
+      if (!this.selectedProjectId()) {
+        this.selectedProjectId.set(this.defaultProjectId());
+      }
+    } catch (error) {
+      this.projectError.set(error instanceof Error ? error.message : 'Could not load visual projects.');
+    } finally {
+      this.loadingProjects.set(false);
+    }
+  }
+
+  async createProject(event: SubmitEvent): Promise<void> {
+    event.preventDefault();
+
+    if (this.creatingProject()) {
+      return;
+    }
+
+    const form = event.currentTarget as HTMLFormElement;
+    const formData = new FormData(form);
+    const name = formData.get('name')?.toString().trim() ?? '';
+    const targetUrl = formData.get('targetUrl')?.toString().trim() ?? '';
+
+    if (!name || !targetUrl) {
+      this.projectError.set('Project name and target URL are required.');
+      return;
+    }
+
+    this.creatingProject.set(true);
+    this.projectMessage.set(null);
+    this.projectError.set(null);
+
+    try {
+      const response = await fetch('/api/projects', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ name, targetUrl }),
+      });
+      const payload = await response.json() as VisualProject | { error?: string };
+
+      if (!response.ok) {
+        throw new Error('error' in payload && payload.error ? payload.error : 'Could not create this project.');
+      }
+
+      await this.loadProjects();
+      const project = payload as VisualProject;
+      this.projectMessage.set(`${project.name} created.`);
+      form.reset();
+      await this.openProject(project.id);
+    } catch (error) {
+      this.projectError.set(error instanceof Error ? error.message : 'Could not create this project.');
+    } finally {
+      this.creatingProject.set(false);
+    }
+  }
+
+  private resetVisualState(): void {
+    this.baselines.set([]);
+    this.selectedBaselineId.set('');
+    this.revisions.set([]);
+    this.selectedRevisionId.set('');
+    this.revisionManifests.set({});
+    this.unavailableArtifacts.set({});
+    this.acceptMessage.set(null);
+    this.acceptError.set(null);
+    this.scanMessage.set(null);
+    this.scanError.set(null);
+    this.sectionMessage.set(null);
+    this.sectionError.set(null);
+    this.sectionSettingsId.set('');
+    this.selectedSectionImageName.set('');
+    this.selectedBaselineImageName.set('');
+  }
+
+  async loadProjectVisualData(): Promise<void> {
+    this.resetVisualState();
+    try {
+      const projectId = this.selectedProjectId() || this.defaultProjectId();
+      if (!projectId) {
+        return;
+      }
+
+      const history = await this.fetchJson<VisualHistory>(`/visual-results/${encodeURIComponent(projectId)}/history.json`);
 
       if (history?.revisions.length) {
         this.revisions.set(history.revisions);
@@ -163,26 +320,32 @@ export class AppComponent implements OnInit, OnDestroy {
         return;
       }
 
-      const manifest = await this.fetchJson<VisualManifest>('/visual-results/manifest.json');
+      const manifest = await this.fetchJson<VisualManifest>(`/visual-results/${encodeURIComponent(projectId)}/manifest.json`);
       this.applyManifest(manifest);
       await this.mergeAvailableSections();
     } catch {
-      this.baselines.set(DEFAULT_BASELINES);
       await this.mergeAvailableSections();
     }
   }
 
-  ngOnDestroy(): void {
-    this.scanAbortController?.abort();
-    window.removeEventListener('popstate', this.handlePopState);
-  }
-
   goToDashboard(): void {
-    this.navigateTo('/', 'dashboard');
+    this.navigateTo('/', 'projects');
+    void this.loadProjects();
   }
 
-  goToHistory(): void {
-    this.navigateTo('/reports/history', 'history');
+  async openProject(projectId: string): Promise<void> {
+    this.selectedProjectId.set(projectId);
+    this.navigateTo(`/workspace${this.projectQuery()}`, 'dashboard');
+    await this.loadProjectVisualData();
+  }
+
+  async goToWorkspace(): Promise<void> {
+    this.navigateTo(`/workspace${this.projectQuery()}`, 'dashboard');
+    await this.loadProjectVisualData();
+  }
+
+  goToSnapshots(): void {
+    this.navigateTo(`/snapshots${this.projectQuery()}`, 'snapshots');
   }
 
   async selectRevision(revisionId: string): Promise<void> {
@@ -210,10 +373,42 @@ export class AppComponent implements OnInit, OnDestroy {
     this.selectedBaselineId.set(baselineId);
   }
 
-  toggleSectionForm(): void {
-    this.sectionFormOpen.update((isOpen) => !isOpen);
+  openSectionSettings(baselineId: string): void {
+    this.selectedBaselineId.set(baselineId);
+    this.sectionSettingsId.set(baselineId);
+    this.selectedBaselineImageName.set('');
     this.sectionMessage.set(null);
     this.sectionError.set(null);
+  }
+
+  closeSectionSettings(): void {
+    this.sectionSettingsId.set('');
+    this.selectedBaselineImageName.set('');
+  }
+
+  toggleReport(): void {
+    this.reportOpen.update((isOpen) => !isOpen);
+  }
+
+  toggleSectionEditing(): void {
+    const isEditing = !this.editingSections();
+    this.editingSections.set(isEditing);
+    this.sectionMessage.set(null);
+    this.sectionError.set(null);
+    if (!isEditing) {
+      this.sectionFormOpen.set(false);
+      this.closeSectionSettings();
+    }
+  }
+
+  toggleSectionForm(): void {
+    const isOpen = !this.sectionFormOpen();
+    this.sectionFormOpen.set(isOpen);
+    this.sectionMessage.set(null);
+    this.sectionError.set(null);
+    if (!isOpen) {
+      this.selectedSectionImageName.set('');
+    }
   }
 
   selectSectionUpload(event: Event): void {
@@ -240,6 +435,17 @@ export class AppComponent implements OnInit, OnDestroy {
     }
 
     return 'Baseline';
+  }
+
+  projectLastScan(project: VisualProject): string {
+    if (!project.stats.lastScanTime) {
+      return 'Never';
+    }
+
+    return new Intl.DateTimeFormat('en', {
+      dateStyle: 'medium',
+      timeStyle: 'short',
+    }).format(new Date(project.stats.lastScanTime));
   }
 
   reportTitle(baseline: VisualBaseline): string {
@@ -290,6 +496,18 @@ export class AppComponent implements OnInit, OnDestroy {
     return baseline.name;
   }
 
+  targetName(baseline: VisualBaseline): string {
+    if (baseline.source.trim()) {
+      return baseline.source;
+    }
+
+    try {
+      return new URL(baseline.targetUrl).hostname.replace(/^www\./, '');
+    } catch {
+      return baseline.name;
+    }
+  }
+
   cardDescription(baseline: VisualBaseline): string {
     const pagePath = baseline.path ?? new URL(baseline.targetUrl).pathname;
     const pageReference = baseline.path === '/' || !baseline.path ? baseline.name : pagePath || '/';
@@ -323,7 +541,7 @@ export class AppComponent implements OnInit, OnDestroy {
   canAcceptSelectedPage(): boolean {
     const revision = this.selectedRevision();
     const baseline = this.selectedBaseline();
-    return Boolean(revision && baseline.status === 'changed');
+    return Boolean(revision && baseline?.status === 'changed');
   }
 
   canAcceptAllRevision(): boolean {
@@ -335,7 +553,7 @@ export class AppComponent implements OnInit, OnDestroy {
     const revision = this.selectedRevision();
 
     if (!revision) {
-      return 'Select a visual revision before accepting a baseline.';
+      return 'Select a visual snapshot before accepting a baseline.';
     }
 
     if (revision.status === 'accepted') {
@@ -378,7 +596,7 @@ export class AppComponent implements OnInit, OnDestroy {
   }
 
   historySnapshotPath(revision: VisualRevision | null, baseline: VisualBaseline): string {
-    return baseline.actualPath ?? `public${revision?.manifestUrl ?? '/visual-results/manifest.json'}`;
+    return baseline.actualPath ?? `public${revision?.manifestUrl ?? `/visual-results/${this.selectedProjectId()}/manifest.json`}`;
   }
 
   diffSnapshotPath(baseline: VisualBaseline): string {
@@ -398,7 +616,11 @@ export class AppComponent implements OnInit, OnDestroy {
     this.acceptError.set(null);
 
     try {
-      const response = await fetch(`/api/visual-revisions/${encodeURIComponent(revision.id)}/items/${encodeURIComponent(baseline.id)}/accept`, {
+      if (!baseline) {
+        return;
+      }
+
+      const response = await fetch(this.projectScopedUrl(`/api/visual-revisions/${encodeURIComponent(revision.id)}/items/${encodeURIComponent(baseline.id)}/accept`), {
         method: 'POST',
       });
       const payload = await response.json() as AcceptRevisionResponse | { error?: string };
@@ -432,7 +654,7 @@ export class AppComponent implements OnInit, OnDestroy {
     this.acceptError.set(null);
 
     try {
-      const response = await fetch(`/api/visual-revisions/${encodeURIComponent(revision.id)}/accept-all`, {
+      const response = await fetch(this.projectScopedUrl(`/api/visual-revisions/${encodeURIComponent(revision.id)}/accept-all`), {
         method: 'POST',
       });
       const payload = await response.json() as AcceptRevisionResponse | { error?: string };
@@ -450,21 +672,82 @@ export class AppComponent implements OnInit, OnDestroy {
   }
 
   async runVisualScan(): Promise<void> {
-    await this.runVisualScanRequest('/api/visual-scan');
+    await this.runVisualScanRequest(this.projectScopedUrl('/api/visual-scan'), false, 'visual-scan');
   }
 
   async runSelectedSectionScan(): Promise<void> {
     const baseline = this.selectedBaseline();
-    await this.runVisualScanRequest(`/api/visual-sections/${encodeURIComponent(baseline.id)}/scan`, true);
+    if (!baseline) {
+      return;
+    }
+    await this.runVisualScanRequest(this.projectScopedUrl(`/api/visual-sections/${encodeURIComponent(baseline.id)}/scan`), true, 'section-scan');
   }
 
-  private async runVisualScanRequest(endpoint: string, replaceSelectedSectionOnly = false): Promise<void> {
+  async refreshSections(): Promise<void> {
+    await this.runSectionRefreshRequest(false);
+  }
+
+  async updateAllGeneratedBaselines(): Promise<void> {
+    const confirmed = window.confirm('Update all generated baselines? This will overwrite approved baseline screenshots for discovered sections.');
+    if (!confirmed) {
+      return;
+    }
+
+    await this.runSectionRefreshRequest(true);
+  }
+
+  jobEyebrow(): string {
+    const job = this.runningJob();
+    return job === 'refresh-sections' || job === 'update-baselines' ? 'Sections' : 'Visual Scan';
+  }
+
+  jobTitle(): string {
+    const job = this.runningJob();
+
+    if (this.cancelingScan()) {
+      if (job === 'refresh-sections') {
+        return 'Canceling refresh...';
+      }
+      if (job === 'update-baselines') {
+        return 'Canceling baseline update...';
+      }
+      return 'Canceling scan...';
+    }
+
+    if (job === 'refresh-sections') {
+      return 'Refreshing sections...';
+    }
+    if (job === 'update-baselines') {
+      return 'Updating generated baselines...';
+    }
+
+    return 'Comparing screenshots...';
+  }
+
+  jobDescription(): string {
+    const job = this.runningJob();
+
+    if (this.cancelingScan()) {
+      return 'Stopping the running job and returning control.';
+    }
+    if (job === 'refresh-sections') {
+      return 'Discovering target pages, registering sections, and capturing missing baselines.';
+    }
+    if (job === 'update-baselines') {
+      return 'Discovering target pages and replacing generated baseline screenshots.';
+    }
+
+    return 'Capturing current pages, checking pixels, and preparing the visual report.';
+  }
+
+  private async runVisualScanRequest(endpoint: string, replaceSelectedSectionOnly = false, job: VisualJob = 'visual-scan'): Promise<void> {
     if (this.scanning()) {
       return;
     }
 
     const controller = new AbortController();
     this.scanAbortController = controller;
+    this.runningJob.set(job);
     this.scanning.set(true);
     this.cancelingScan.set(false);
     this.scanMessage.set(null);
@@ -500,9 +783,10 @@ export class AppComponent implements OnInit, OnDestroy {
       await this.mergeAvailableSections();
       this.scanMessage.set(scanPayload.message);
       this.imageVersion.set(String(Date.now()));
+      await this.loadProjects();
     } catch (error) {
       if (this.isAbortError(error)) {
-        this.scanMessage.set('Visual scan canceled.');
+        this.scanMessage.set(job === 'section-scan' ? 'Section scan canceled.' : 'Visual scan canceled.');
       } else {
         this.scanError.set(error instanceof Error ? error.message : 'Could not run the visual scan.');
       }
@@ -511,6 +795,60 @@ export class AppComponent implements OnInit, OnDestroy {
         this.scanAbortController = null;
       }
       this.cancelingScan.set(false);
+      this.runningJob.set(null);
+      this.scanning.set(false);
+    }
+  }
+
+  private async runSectionRefreshRequest(update: boolean): Promise<void> {
+    if (this.scanning()) {
+      return;
+    }
+
+    const controller = new AbortController();
+    const job: VisualJob = update ? 'update-baselines' : 'refresh-sections';
+    const endpoint = this.projectScopedUrl('/api/visual-sections/crawl', update ? { update: 'true' } : undefined);
+
+    this.scanAbortController = controller;
+    this.runningJob.set(job);
+    this.scanning.set(true);
+    this.cancelingScan.set(false);
+    this.scanMessage.set(null);
+    this.scanError.set(null);
+    this.acceptMessage.set(null);
+    this.acceptError.set(null);
+    this.sectionMessage.set(null);
+    this.sectionError.set(null);
+
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        signal: controller.signal,
+      });
+      const payload = await response.json() as SectionRefreshResponse | { error?: string };
+
+      if (!response.ok) {
+        throw new Error('error' in payload && payload.error ? payload.error : 'Could not refresh sections.');
+      }
+
+      const refreshPayload = payload as SectionRefreshResponse;
+      this.applyManifest(refreshPayload.manifest);
+      this.sectionMessage.set(refreshPayload.message);
+      this.sectionError.set(null);
+      this.imageVersion.set(String(Date.now()));
+      await this.loadProjects();
+    } catch (error) {
+      if (this.isAbortError(error)) {
+        this.sectionMessage.set(update ? 'Baseline update canceled.' : 'Section refresh canceled.');
+      } else {
+        this.sectionError.set(error instanceof Error ? error.message : 'Could not refresh sections.');
+      }
+    } finally {
+      if (this.scanAbortController === controller) {
+        this.scanAbortController = null;
+      }
+      this.cancelingScan.set(false);
+      this.runningJob.set(null);
       this.scanning.set(false);
     }
   }
@@ -539,7 +877,7 @@ export class AppComponent implements OnInit, OnDestroy {
     this.sectionError.set(null);
 
     try {
-      const response = await fetch('/api/visual-sections', {
+      const response = await fetch(this.projectScopedUrl('/api/visual-sections'), {
         method: 'POST',
         body: formData,
       });
@@ -555,7 +893,9 @@ export class AppComponent implements OnInit, OnDestroy {
       this.sectionMessage.set(sectionPayload.message);
       this.sectionError.set(null);
       this.selectedSectionImageName.set('');
+      this.sectionFormOpen.set(false);
       this.imageVersion.set(String(Date.now()));
+      await this.loadProjects();
       form.reset();
     } catch (error) {
       this.sectionError.set(error instanceof Error ? error.message : 'Could not add this section.');
@@ -577,6 +917,53 @@ export class AppComponent implements OnInit, OnDestroy {
     form.reset();
   }
 
+  async updateSelectedSectionDetails(event: SubmitEvent): Promise<void> {
+    event.preventDefault();
+
+    const baseline = this.sectionSettingsBaseline();
+    if (!baseline || this.updatingSection()) {
+      return;
+    }
+
+    const form = event.currentTarget as HTMLFormElement;
+    const formData = new FormData(form);
+    const name = formData.get('name')?.toString().trim() ?? '';
+
+    if (!name) {
+      this.sectionError.set('Section name is required.');
+      return;
+    }
+
+    this.updatingSection.set(true);
+    this.sectionMessage.set(null);
+    this.sectionError.set(null);
+
+    try {
+      const response = await fetch(this.projectScopedUrl(`/api/visual-sections/${encodeURIComponent(baseline.id)}`), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ name }),
+      });
+      const payload = await response.json() as SectionResponse | { error?: string };
+
+      if (!response.ok) {
+        throw new Error('error' in payload && payload.error ? payload.error : 'Could not rename this section.');
+      }
+
+      const sectionPayload = payload as SectionResponse;
+      this.mergeSection(sectionPayload.section);
+      this.selectedBaselineId.set(sectionPayload.section.id);
+      this.sectionMessage.set(sectionPayload.message);
+      this.sectionError.set(null);
+    } catch (error) {
+      this.sectionError.set(error instanceof Error ? error.message : 'Could not rename this section.');
+    } finally {
+      this.updatingSection.set(false);
+    }
+  }
+
   async overrideSelectedBaselineImage(event: Event): Promise<void> {
     const input = event.target as HTMLInputElement;
     const file = input.files?.[0];
@@ -591,6 +978,45 @@ export class AppComponent implements OnInit, OnDestroy {
     input.value = '';
   }
 
+  async removeSection(sectionId: string, sectionName: string): Promise<void> {
+    if (this.removingSectionId()) {
+      return;
+    }
+
+    const confirmed = window.confirm(`Remove "${sectionName}" from visual sections? This does not change existing visual history.`);
+    if (!confirmed) {
+      return;
+    }
+
+    this.removingSectionId.set(sectionId);
+    this.sectionMessage.set(null);
+    this.sectionError.set(null);
+
+    try {
+      const response = await fetch(this.projectScopedUrl(`/api/visual-sections/${encodeURIComponent(sectionId)}`), {
+        method: 'DELETE',
+      });
+      const payload = await response.json() as SectionDeleteResponse | { error?: string };
+
+      if (!response.ok) {
+        throw new Error('error' in payload && payload.error ? payload.error : 'Could not remove this section.');
+      }
+
+      const deletePayload = payload as SectionDeleteResponse;
+      this.removeSectionFromState(sectionId);
+      if (this.sectionSettingsId() === sectionId) {
+        this.closeSectionSettings();
+      }
+      this.sectionMessage.set(deletePayload.message);
+      this.imageVersion.set(String(Date.now()));
+      await this.loadProjects();
+    } catch (error) {
+      this.sectionError.set(error instanceof Error ? error.message : 'Could not remove this section.');
+    } finally {
+      this.removingSectionId.set('');
+    }
+  }
+
   private async uploadSelectedBaselineImage(formData: FormData): Promise<void> {
     const baseline = this.selectedBaseline();
     if (!baseline || this.updatingBaseline()) {
@@ -602,7 +1028,7 @@ export class AppComponent implements OnInit, OnDestroy {
     this.sectionError.set(null);
 
     try {
-      const response = await fetch(`/api/visual-sections/${encodeURIComponent(baseline.id)}/baseline`, {
+      const response = await fetch(this.projectScopedUrl(`/api/visual-sections/${encodeURIComponent(baseline.id)}/baseline`), {
         method: 'POST',
         body: formData,
       });
@@ -674,10 +1100,11 @@ export class AppComponent implements OnInit, OnDestroy {
     this.applyManifest(payload.manifest);
     this.acceptMessage.set(payload.message);
     this.imageVersion.set(String(Date.now()));
+    void this.loadProjects();
   }
 
   private async mergeAvailableSections(): Promise<void> {
-    const manifest = await this.fetchJson<VisualManifest>('/api/visual-sections').catch(() => null);
+    const manifest = await this.fetchJson<VisualManifest>(this.projectScopedUrl('/api/visual-sections')).catch(() => null);
     if (!manifest?.items.length) {
       return;
     }
@@ -723,8 +1150,19 @@ export class AppComponent implements OnInit, OnDestroy {
     this.selectedBaselineId.set(section.id);
   }
 
+  private removeSectionFromState(sectionId: string): void {
+    this.baselines.update((baselines) => {
+      const remainingSections = baselines.filter((baseline) => baseline.id !== sectionId);
+      return remainingSections.length ? remainingSections : baselines;
+    });
+
+    if (this.selectedBaselineId() === sectionId) {
+      this.selectedBaselineId.set(this.baselines()[0]?.id ?? '');
+    }
+  }
+
   private navigateTo(path: string, page: DashboardPage): void {
-    if (window.location.pathname !== path) {
+    if (`${window.location.pathname}${window.location.search}` !== path) {
       window.history.pushState({}, '', path);
     }
 
@@ -733,9 +1171,40 @@ export class AppComponent implements OnInit, OnDestroy {
 
   private pageFromLocation(): DashboardPage {
     if (typeof window === 'undefined') {
-      return 'dashboard';
+      return 'projects';
     }
 
-    return window.location.pathname.startsWith('/reports/history') ? 'history' : 'dashboard';
+    const path = window.location.pathname;
+    if (path.startsWith('/snapshots') || path.startsWith('/reports/history')) {
+      return 'snapshots';
+    }
+    if (path.startsWith('/workspace')) {
+      return 'dashboard';
+    }
+    return 'projects';
+  }
+
+  private projectIdFromLocation(): string {
+    if (typeof window === 'undefined') {
+      return '';
+    }
+
+    return new URLSearchParams(window.location.search).get('project') ?? '';
+  }
+
+  private projectQuery(): string {
+    const projectId = this.selectedProjectId() || this.defaultProjectId();
+    return projectId ? `?project=${encodeURIComponent(projectId)}` : '';
+  }
+
+  private projectScopedUrl(path: string, extraParams?: Record<string, string>): string {
+    const params = new URLSearchParams(extraParams);
+    const projectId = this.selectedProjectId() || this.defaultProjectId();
+    if (projectId) {
+      params.set('project', projectId);
+    }
+
+    const query = params.toString();
+    return query ? `${path}?${query}` : path;
   }
 }

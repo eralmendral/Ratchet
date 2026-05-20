@@ -1,7 +1,7 @@
 {
   "version": 1,
   "targetUrl": "https://visual-test-sample.vercel.app/",
-  "generatedAt": "2026-05-20T11:28:39.352Z",
+  "generatedAt": "2026-05-20T12:40:29.506Z",
   "pages": [
     {
       "name": "Visual regression sample targets",
@@ -11,7 +11,7 @@
       "snapshotName": "home-page.png",
       "baselineFileName": "home-page-chromium-darwin.png",
       "baselineImageUrl": "/assets/baselines/visual-test-sample/home-page-chromium-darwin.png",
-      "snapshotPath": "tests/visual-test-sample.spec.ts-snapshots/home-page-chromium-darwin.png"
+      "snapshotPath": "tests/visual-projects/visual-test-sample/snapshots/home-page-chromium-darwin.png"
     },
     {
       "name": "Box Grid Target V3",
@@ -21,7 +21,7 @@
       "snapshotName": "box-grid-page.png",
       "baselineFileName": "box-grid-page-chromium-darwin.png",
       "baselineImageUrl": "/assets/baselines/visual-test-sample/box-grid-page-chromium-darwin.png",
-      "snapshotPath": "tests/visual-test-sample.spec.ts-snapshots/box-grid-page-chromium-darwin.png"
+      "snapshotPath": "tests/visual-projects/visual-test-sample/snapshots/box-grid-page-chromium-darwin.png"
     },
     {
       "name": "Operations Dashboard",
@@ -31,18 +31,7 @@
       "snapshotName": "dashboard-page.png",
       "baselineFileName": "dashboard-page-chromium-darwin.png",
       "baselineImageUrl": "/assets/baselines/visual-test-sample/dashboard-page-chromium-darwin.png",
-      "snapshotPath": "tests/visual-test-sample.spec.ts-snapshots/dashboard-page-chromium-darwin.png"
-    },
-    {
-      "id": "test-page",
-      "name": "test",
-      "path": "/",
-      "url": "https://visual-test-sample.vercel.app/",
-      "snapshotName": "test-page.png",
-      "baselineFileName": "test-page-chromium-darwin.png",
-      "baselineImageUrl": "/assets/baselines/visual-test-sample/test-page-chromium-darwin.png",
-      "snapshotPath": "tests/visual-test-sample.spec.ts-snapshots/test-page-chromium-darwin.png",
-      "manualBaseline": true
+      "snapshotPath": "tests/visual-projects/visual-test-sample/snapshots/dashboard-page-chromium-darwin.png"
     }
   ]
 }

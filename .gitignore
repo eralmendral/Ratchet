@@ -1,6 +1,7 @@
-
-# Playwright
+# Dependencies
 node_modules/
+
+# Playwright generated output
 /test-results/
 /playwright-report/
 /blob-report/
@@ -10,4 +11,6 @@ node_modules/
 # Angular
 /.angular/
 /dist/
+
+# Visual scan generated output
 /public/visual-results/

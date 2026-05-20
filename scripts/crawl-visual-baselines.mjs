@@ -1,12 +1,14 @@
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
+import {
+  defaultVisualProjectTargetUrl,
+  projectBaselineImageUrl,
+  projectSnapshotPath,
+  resolveVisualProject,
+} from './visual-projects.mjs';
 
-const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const manifestPath = path.join(rootDir, 'tests', 'visual-pages.json');
-const snapshotDir = path.join(rootDir, 'tests', 'visual-test-sample.spec.ts-snapshots');
-const defaultTargetUrl = 'https://visual-test-sample.vercel.app/';
+const defaultTargetUrl = defaultVisualProjectTargetUrl;
 const defaultMaxPages = 25;
 const browserName = 'chromium';
 const platformName = process.platform;
@@ -39,6 +41,33 @@ function slugFromUrl(url) {
   const pathSlug = pathParts.at(-1) ?? pathParts.join('-');
 
   return pathSlug ? `${pathSlug}-page` : 'home-page';
+}
+
+function uniqueVisualPageId(baseId, reservedIds) {
+  if (!reservedIds.has(baseId)) {
+    return baseId;
+  }
+
+  for (let index = 2; ; index += 1) {
+    const candidate = `${baseId}-${index}`;
+
+    if (!reservedIds.has(candidate)) {
+      return candidate;
+    }
+  }
+}
+
+function withVisualPageId(projectId, visualPage, id) {
+  const baselineFileName = `${id}-${browserName}-${platformName}.png`;
+
+  return {
+    ...visualPage,
+    id,
+    snapshotName: `${id}.png`,
+    baselineFileName,
+    baselineImageUrl: projectBaselineImageUrl(projectId, baselineFileName),
+    snapshotPath: projectSnapshotPath(projectId, baselineFileName),
+  };
 }
 
 function canonicalizeUrl(url) {
@@ -75,7 +104,7 @@ async function fileExists(filePath) {
   }
 }
 
-async function readExistingManifest() {
+async function readExistingManifest(manifestPath) {
   try {
     return JSON.parse(await readFile(manifestPath, 'utf8'));
   } catch {
@@ -95,7 +124,7 @@ async function collectPageName(page, url) {
   return toTitle(slug || 'Home');
 }
 
-async function discoverPages(page, targetUrl, maxPages) {
+async function discoverPages(page, targetUrl, maxPages, projectId) {
   const rootUrl = canonicalizeUrl(targetUrl);
   const origin = new URL(rootUrl).origin;
   const queue = [rootUrl];
@@ -118,16 +147,11 @@ async function discoverPages(page, targetUrl, maxPages) {
     const slug = slugFromUrl(currentUrl);
     const parsedUrl = new URL(currentUrl);
 
-    discoveredPages.push({
-      id: slug,
+    discoveredPages.push(withVisualPageId(projectId, {
       name: pageName,
       path: `${parsedUrl.pathname}${parsedUrl.search}`,
       url: currentUrl,
-      snapshotName: `${slug}.png`,
-      baselineFileName: `${slug}-${browserName}-${platformName}.png`,
-      baselineImageUrl: `/assets/baselines/visual-test-sample/${slug}-${browserName}-${platformName}.png`,
-      snapshotPath: `tests/visual-test-sample.spec.ts-snapshots/${slug}-${browserName}-${platformName}.png`,
-    });
+    }, slug));
 
     const links = await page.locator('a[href]').evaluateAll((anchors) => {
       return anchors
@@ -147,7 +171,7 @@ async function discoverPages(page, targetUrl, maxPages) {
   return discoveredPages;
 }
 
-async function captureBaselines(page, pages, update) {
+async function captureBaselines(page, pages, update, snapshotDir) {
   await mkdir(snapshotDir, { recursive: true });
 
   for (const visualPage of pages) {
@@ -175,11 +199,12 @@ async function captureBaselines(page, pages, update) {
 }
 
 export async function crawlVisualBaselines(options = {}) {
-  const targetUrl = options.targetUrl ?? defaultTargetUrl;
+  const { project, paths } = await resolveVisualProject(options.projectId ?? null);
+  const existingManifest = await readExistingManifest(paths.visualPagesPath);
+  const targetUrl = options.targetUrl ?? existingManifest?.targetUrl ?? defaultTargetUrl;
   const maxPages = options.maxPages ?? defaultMaxPages;
   const update = options.update ?? false;
   const sectionId = options.sectionId ?? null;
-  const existingManifest = await readExistingManifest();
   const browser = await chromium.launch();
 
   try {
@@ -197,21 +222,26 @@ export async function crawlVisualBaselines(options = {}) {
         throw new Error(`Unknown visual section: ${sectionId}`);
       }
 
-      await captureBaselines(page, sectionPages, update);
+      await captureBaselines(page, sectionPages, update, paths.snapshotDir);
       return existingManifest;
     }
 
-    const discoveredPages = await discoverPages(page, targetUrl, maxPages);
+    const discoveredPages = await discoverPages(page, targetUrl, maxPages, project.id);
     const manualPages = Array.isArray(existingManifest?.pages)
       ? existingManifest.pages.filter((manifestPage) => manifestPage.manualBaseline)
       : [];
-    const discoveredIds = new Set(discoveredPages.map((visualPage) => visualPage.id));
-    const retainedManualPages = manualPages.filter((visualPage) => !discoveredIds.has(visualPage.id));
+    const reservedIds = new Set(manualPages.map((visualPage) => visualPage.id));
+    const reconciledDiscoveredPages = discoveredPages.map((visualPage) => {
+      const pageId = uniqueVisualPageId(visualPage.id, reservedIds);
+      reservedIds.add(pageId);
+
+      return pageId === visualPage.id ? visualPage : withVisualPageId(project.id, visualPage, pageId);
+    });
     const manifestPages = discoveredPages.length > 0
-      ? [...discoveredPages, ...retainedManualPages]
+      ? [...reconciledDiscoveredPages, ...manualPages]
       : existingManifest?.pages ?? [];
 
-    await captureBaselines(page, manifestPages, update);
+    await captureBaselines(page, manifestPages, update, paths.snapshotDir);
 
     const manifest = {
       version: 1,
@@ -220,7 +250,7 @@ export async function crawlVisualBaselines(options = {}) {
       pages: manifestPages,
     };
 
-    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+    await writeFile(paths.visualPagesPath, `${JSON.stringify(manifest, null, 2)}\n`);
     return manifest;
   } finally {
     await browser.close();
@@ -229,7 +259,8 @@ export async function crawlVisualBaselines(options = {}) {
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   await crawlVisualBaselines({
-    targetUrl: getArgValue('target', defaultTargetUrl),
+    targetUrl: getArgValue('target', null),
+    projectId: getArgValue('project', process.env.VISUAL_PROJECT_ID ?? null),
     maxPages: Number(getArgValue('max-pages', String(defaultMaxPages))),
     sectionId: getArgValue('section', null),
     update: hasArg('update'),

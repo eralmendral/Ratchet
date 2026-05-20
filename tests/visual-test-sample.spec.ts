@@ -2,7 +2,8 @@ import { expect, test } from '@playwright/test';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
-const TARGET_URL = 'https://visual-test-sample.vercel.app/';
+const projectId = process.env['VISUAL_PROJECT_ID'] ?? 'visual-test-sample';
+const manifestPath = path.join(__dirname, 'visual-projects', projectId, 'visual-pages.json');
 
 type VisualPage = {
   readonly id: string;
@@ -12,14 +13,16 @@ type VisualPage = {
 };
 
 type VisualPagesManifest = {
+  readonly targetUrl: string;
   readonly pages: readonly VisualPage[];
 };
 
 const manifest = JSON.parse(
-  readFileSync(path.join(__dirname, 'visual-pages.json'), 'utf8'),
+  readFileSync(manifestPath, 'utf8'),
 ) as VisualPagesManifest;
 
-const sectionId = process.env.VISUAL_SECTION_ID;
+const TARGET_URL = manifest.targetUrl;
+const sectionId = process.env['VISUAL_SECTION_ID'];
 const VISUAL_PAGES = sectionId
   ? manifest.pages.filter((visualPage) => visualPage.id === sectionId)
   : manifest.pages;
@@ -28,7 +31,7 @@ if (sectionId && VISUAL_PAGES.length === 0) {
   throw new Error(`Unknown visual section: ${sectionId}`);
 }
 
-test.describe('Visual Test Sample', () => {
+test.describe(projectId, () => {
   test.skip(({ browserName }) => browserName !== 'chromium', 'Visual snapshot baseline is captured for Chromium.');
 
   test.use({

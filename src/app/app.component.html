@@ -1,34 +1,80 @@
+@if (currentPage() === 'projects') {
+  <main class="projects-shell">
+    <header class="projects-header">
+      <div>
+        <p class="eyebrow">Ratchet</p>
+        <h1>Projects</h1>
+      </div>
+    </header>
+
+    <section class="project-create-panel" aria-label="Create visual project">
+      <form class="project-form" (submit)="createProject($event)">
+        <label>
+          <span>Project name</span>
+          <input name="name" type="text" autocomplete="off" required>
+        </label>
+        <label>
+          <span>Target URL</span>
+          <input name="targetUrl" type="url" required>
+        </label>
+        <button type="submit" [disabled]="creatingProject()">
+          {{ creatingProject() ? 'Creating' : 'Create' }}
+        </button>
+      </form>
+      @if (projectMessage() || projectError()) {
+        <div class="section-status" [class.section-status--error]="projectError()">
+          {{ projectError() ?? projectMessage() }}
+        </div>
+      }
+    </section>
+
+    <section class="project-grid" aria-label="Visual projects">
+      @if (loadingProjects()) {
+        <div class="project-empty-state">Loading projects</div>
+      } @else {
+        @for (project of projects(); track project.id) {
+          <article class="project-card">
+            <div class="project-card-main">
+              <p class="eyebrow">{{ statusLabel(project.stats.latestStatus) }}</p>
+              <h2>{{ project.name }}</h2>
+              <a [href]="project.targetUrl" target="_blank" rel="noreferrer">{{ project.targetUrl }}</a>
+            </div>
+            <div class="project-stats">
+              <div>
+                <span>Changed</span>
+                <strong>{{ project.stats.changedPages }}</strong>
+              </div>
+              <div>
+                <span>Sections</span>
+                <strong>{{ project.stats.totalSections }}</strong>
+              </div>
+              <div>
+                <span>Last scan</span>
+                <strong>{{ projectLastScan(project) }}</strong>
+              </div>
+            </div>
+            <button type="button" (click)="openProject(project.id)">Open</button>
+          </article>
+        } @empty {
+          <div class="project-empty-state">No projects</div>
+        }
+      }
+    </section>
+  </main>
+} @else {
 <main class="dashboard-shell" [attr.aria-busy]="scanning()">
   <aside class="baseline-rail" aria-label="Original screenshot baselines" [attr.inert]="scanning() ? '' : null">
     <div class="rail-header">
       <p class="eyebrow">Sections</p>
-      <button class="add-section-button" type="button" (click)="toggleSectionForm()">
-        {{ sectionFormOpen() ? 'Close' : 'Add section' }}
+    </div>
+
+    <div class="section-maintenance-actions">
+      <button type="button" [disabled]="scanning() || !baselines().length" (click)="runVisualScan()">
+        {{ runningJob() === 'visual-scan' ? 'Scanning' : 'Visual Scan' }}
       </button>
     </div>
 
-    @if (sectionFormOpen()) {
-      <form class="section-form" (submit)="addSection($event)">
-        <label>
-          <span>Section name</span>
-          <input name="name" type="text" autocomplete="off" required placeholder="Checkout page">
-        </label>
-        <label>
-          <span>Page URL</span>
-          <input name="url" type="url" required [value]="selectedBaseline().targetUrl" placeholder="https://example.com/page">
-        </label>
-        <label class="file-field">
-          <span>Baseline PNG</span>
-          <input name="baselineImage" type="file" accept="image/png" required (change)="selectSectionUpload($event)">
-          <small>{{ selectedSectionImageName() || 'Choose a PNG image' }}</small>
-        </label>
-        <button type="submit" [disabled]="addingSection()">
-          {{ addingSection() ? 'Adding...' : 'Save section' }}
-        </button>
-      </form>
-    }
-
-    @if (sectionMessage() || sectionError()) {
+    @if (!sectionFormOpen() && (sectionMessage() || sectionError())) {
       <div class="section-status" [class.section-status--error]="sectionError()">
         {{ sectionError() ?? sectionMessage() }}
       </div>
@@ -36,21 +82,44 @@
 
     <div class="baseline-list">
       @for (baseline of baselines(); track baseline.id) {
-        <button
-          class="baseline-card"
-          type="button"
-          [class.is-selected]="baseline.id === selectedBaseline().id"
-          [class.is-clean]="baseline.status === 'clean'"
-          [class.is-changed]="baseline.status === 'changed'"
-          (click)="selectBaseline(baseline.id)"
-        >
-          <img [src]="imageSrc(baseline.baselineImageUrl)" [alt]="baseline.source + ' ' + baseline.name + ' baseline screenshot'">
-          <span>
-            <strong>{{ cardTitle(baseline) }}</strong>
-            <small>{{ cardDescription(baseline) }}</small>
-          </span>
+        <div class="baseline-card-shell">
+          <button
+            class="baseline-card"
+            type="button"
+            [class.is-selected]="baseline.id === selectedBaseline()?.id"
+            [class.is-clean]="baseline.status === 'clean'"
+            [class.is-changed]="baseline.status === 'changed'"
+            (click)="selectBaseline(baseline.id)"
+          >
+            <img [src]="imageSrc(baseline.baselineImageUrl)" [alt]="baseline.source + ' ' + baseline.name + ' baseline screenshot'">
+            <span>
+              <strong>{{ cardTitle(baseline) }}</strong>
+              <small>{{ cardDescription(baseline) }}</small>
+            </span>
+          </button>
+          @if (editingSections()) {
+            <div class="section-card-actions" aria-label="Section management actions">
+              <button type="button" (click)="openSectionSettings(baseline.id)">
+                Update
+              </button>
+              <button type="button" [disabled]="removingSectionId() === baseline.id" (click)="removeSection(baseline.id, cardTitle(baseline))">
+                {{ removingSectionId() === baseline.id ? 'Removing' : 'Remove' }}
+              </button>
+            </div>
+          }
+        </div>
+      }
+    </div>
+
+    <div class="rail-edit-panel">
+      @if (editingSections()) {
+        <button class="rail-secondary-action" type="button" (click)="toggleSectionForm()">
+          Add Section
         </button>
       }
+      <button class="rail-primary-action" type="button" (click)="toggleSectionEditing()">
+        {{ editingSections() ? 'Save' : 'Edit' }}
+      </button>
     </div>
 
   </aside>
@@ -65,26 +134,21 @@
           }
         </div>
         <div class="workspace-actions">
-          @if (currentPage() === 'history') {
+          @if (currentPage() === 'snapshots') {
             <button class="nav-button nav-button--secondary" type="button" (click)="goToDashboard()">
-              Dashboard
+              Projects
+            </button>
+            <button class="nav-button nav-button--secondary" type="button" (click)="goToWorkspace()">
+              Workspace
             </button>
           } @else {
-            <button class="nav-button nav-button--secondary" type="button" (click)="goToHistory()">
-              Reports / History
+            <button class="nav-button nav-button--secondary" type="button" (click)="goToDashboard()">
+              Projects
             </button>
-            <a class="target-link" [href]="baseline.targetUrl" target="_blank" rel="noreferrer">
-              Open Target
-            </a>
-          }
-          @if (currentPage() !== 'history') {
-            <button class="scan-button section-scan-button" type="button" [disabled]="scanning()" (click)="runSelectedSectionScan()">
-              {{ scanning() ? 'Scanning...' : 'Run section scan' }}
+            <button class="nav-button nav-button--secondary" type="button" (click)="goToSnapshots()">
+              Snapshots
             </button>
           }
-          <button class="scan-button" type="button" [disabled]="scanning()" (click)="runVisualScan()">
-            {{ scanning() ? 'Scanning...' : 'Run visual scan' }}
-          </button>
         </div>
       </header>
 
@@ -99,17 +163,13 @@
           <article class="preview-panel original-panel">
             <div class="panel-heading">
               <span>Original Baseline</span>
-              <label class="inline-upload-button">
-                <input type="file" accept="image/png" [disabled]="updatingBaseline()" (change)="overrideSelectedBaselineImage($event)">
-                <span>{{ updatingBaseline() ? 'Updating...' : 'Override baseline' }}</span>
-              </label>
             </div>
             <div class="image-frame">
               <img [src]="imageSrc(baseline.baselineImageUrl)" [alt]="baseline.source + ' original baseline screenshot'">
             </div>
           </article>
 
-          <article class="preview-panel artifact-panel">
+          <article class="preview-panel artifact-panel current-run-panel">
             <div class="panel-heading">
               <span>Current Run</span>
               <small>Actual screenshot</small>
@@ -129,6 +189,27 @@
               </div>
             }
           </article>
+
+          <div class="current-run-actions" aria-label="Current run actions">
+            @if (canAcceptSelectedPage()) {
+              <div class="current-run-notice">
+                <strong>Difference</strong>
+                <span>Review before replacing the approved baseline.</span>
+              </div>
+              <button class="accept-page-action" type="button" [disabled]="acceptingRevision()" (click)="acceptSelectedPage()">
+                {{ acceptingRevision() ? 'Approving' : 'Approve' }}
+              </button>
+            }
+            <button class="section-scan-action" type="button" [disabled]="scanning()" (click)="runSelectedSectionScan()">
+              {{ runningJob() === 'section-scan' ? 'Scanning' : 'Compare' }}
+            </button>
+            <a class="target-link target-link--secondary" [href]="baseline.targetUrl" target="_blank" rel="noreferrer">
+              Open
+            </a>
+            @if (canAcceptSelectedPage() || acceptMessage() || acceptError()) {
+              <small>{{ acceptMessage() ?? acceptError() ?? 'Replaces the approved baseline with the current screenshot.' }}</small>
+            }
+          </div>
 
           <article class="preview-panel artifact-panel diff-panel">
             <div class="panel-heading">
@@ -150,14 +231,37 @@
               </div>
             }
           </article>
+
+          <section class="report-panel diff-report-panel" [class.is-collapsed]="!reportOpen()" [class.report-panel--changed]="baseline.status === 'changed'">
+            <div class="report-copy">
+              <div class="report-header">
+                <div>
+                  <p class="eyebrow">Plain Language Report</p>
+                  <h3>{{ reportTitle(baseline) }}</h3>
+                </div>
+                <button class="report-toggle" type="button" (click)="toggleReport()">
+                  {{ reportOpen() ? 'Close' : 'Open' }}
+                </button>
+              </div>
+              @if (reportOpen()) {
+                <p>{{ reportDescription(baseline) }}</p>
+              }
+            </div>
+            @if (reportOpen()) {
+              <div class="error-location">
+                <span>{{ locationLabel(baseline) }}</span>
+                <strong>{{ errorLocation(baseline) }}</strong>
+              </div>
+            }
+          </section>
         </section>
       }
 
-      @if (currentPage() === 'history') {
+      @if (currentPage() === 'snapshots') {
         @if (selectedRevision(); as revision) {
-          <section class="revision-panel" aria-label="Visual revision history">
+          <section class="revision-panel" aria-label="Visual snapshots">
             <div class="revision-current">
-              <p class="eyebrow">Selected Revision</p>
+              <p class="eyebrow">Selected Snapshot</p>
               <h3>{{ revisionDisplayLabel(revision) }}</h3>
               <span>{{ revisionSummary(revision) }}</span>
               <span>UUID: {{ revisionUUID(revision) }}</span>
@@ -165,17 +269,17 @@
               <div class="revision-actions">
                 @if (canAcceptSelectedPage()) {
                   <button type="button" [disabled]="acceptingRevision()" (click)="acceptSelectedPage()">
-                    {{ acceptingRevision() ? 'Accepting page...' : 'Accept this page as baseline' }}
+                    {{ acceptingRevision() ? 'Approving' : 'Approve' }}
                   </button>
                 }
                 <button class="accept-all-action" type="button" [disabled]="!canAcceptAllRevision() || acceptingAll()" (click)="acceptAllChangedPages()">
-                  {{ acceptingAll() ? 'Accepting all...' : 'Accept all changed pages' }}
+                  {{ acceptingAll() ? 'Approving' : 'Approve all' }}
                 </button>
                 <small>{{ acceptMessage() ?? acceptError() ?? approvalHint() }}</small>
               </div>
             </div>
 
-            <div class="revision-list" aria-label="Recent visual revisions">
+            <div class="revision-list" aria-label="Recent visual snapshots">
               @for (item of revisions(); track item.id) {
                 <button
                   type="button"
@@ -194,26 +298,14 @@
           </section>
         }
 
-        <section class="report-panel" [class.report-panel--changed]="baseline.status === 'changed'">
-          <div>
-            <p class="eyebrow">Plain Language Report</p>
-            <h3>{{ reportTitle(baseline) }}</h3>
-            <p>{{ reportDescription(baseline) }}</p>
-          </div>
-          <div class="error-location">
-            <span>{{ locationLabel(baseline) }}</span>
-            <strong>{{ errorLocation(baseline) }}</strong>
-          </div>
-        </section>
-
         <section class="metadata-strip" aria-label="Selected baseline details">
           @if (selectedRevision(); as revision) {
             <div>
-              <span>Revision UUID</span>
+              <span>Snapshot UUID</span>
               <strong>{{ revisionUUID(revision) }}</strong>
             </div>
             <div>
-              <span>Revision Date</span>
+              <span>Snapshot Date</span>
               <strong>{{ revisionDateTime(revision) }}</strong>
             </div>
           }
@@ -222,7 +314,7 @@
             <strong>{{ baseline.snapshotPath }}</strong>
           </div>
           <div>
-            <span>History Snapshot</span>
+            <span>Snapshot File</span>
             <strong>{{ historySnapshotPath(selectedRevision(), baseline) }}</strong>
           </div>
           <div>
@@ -235,6 +327,39 @@
           </div>
         </section>
       }
+    } @else {
+      <header class="workspace-header">
+        <div>
+          <p class="eyebrow">{{ selectedProject()?.name ?? 'Project' }}</p>
+          <h1>No Sections</h1>
+        </div>
+        <div class="workspace-actions">
+          <button class="nav-button nav-button--secondary" type="button" (click)="goToDashboard()">
+            Projects
+          </button>
+        </div>
+      </header>
+
+      @if (scanMessage() || scanError() || sectionMessage() || sectionError()) {
+        <section class="scan-status" [class.scan-status--error]="scanError() || sectionError()">
+          {{ scanError() ?? sectionError() ?? scanMessage() ?? sectionMessage() }}
+        </section>
+      }
+
+      <section class="empty-project-panel">
+        <h2>{{ selectedProject()?.name ?? 'Project' }}</h2>
+        <a class="target-link" [href]="selectedProject()?.targetUrl ?? '#'" target="_blank" rel="noreferrer">
+          Open Target
+        </a>
+        <div class="empty-project-actions">
+          <button type="button" [disabled]="scanning()" (click)="refreshSections()">
+            {{ refreshingSections() ? 'Refreshing' : 'Refresh Sections' }}
+          </button>
+          <button type="button" (click)="toggleSectionForm()">
+            Add Section
+          </button>
+        </div>
+      </section>
     }
   </section>
 
@@ -247,9 +372,9 @@
           <span></span>
         </div>
         <div>
-          <p class="eyebrow">Visual Scan</p>
-          <h2 id="scan-overlay-title">{{ cancelingScan() ? 'Canceling scan...' : 'Comparing screenshots...' }}</h2>
-          <p>{{ cancelingScan() ? 'Stopping the running visual scan and returning control.' : 'Capturing current pages, checking pixels, and preparing the visual report.' }}</p>
+          <p class="eyebrow">{{ jobEyebrow() }}</p>
+          <h2 id="scan-overlay-title">{{ jobTitle() }}</h2>
+          <p>{{ jobDescription() }}</p>
         </div>
         <div class="scan-skeleton" aria-hidden="true">
           <span></span>
@@ -257,9 +382,87 @@
           <span></span>
         </div>
         <button class="cancel-scan-button" type="button" [disabled]="cancelingScan()" (click)="cancelVisualScan()">
-          {{ cancelingScan() ? 'Canceling...' : 'Cancel scan' }}
+          {{ cancelingScan() ? 'Canceling' : 'Cancel' }}
         </button>
       </div>
     </section>
   }
+
+  @if (sectionSettingsBaseline(); as settingsBaseline) {
+    <section class="settings-overlay" role="dialog" aria-modal="true" aria-labelledby="section-settings-title">
+      <div class="settings-modal">
+        <header class="settings-header">
+          <div>
+            <p class="eyebrow">Section Settings</p>
+            <h2 id="section-settings-title">{{ cardTitle(settingsBaseline) }}</h2>
+          </div>
+          <button class="settings-close-button" type="button" (click)="closeSectionSettings()" aria-label="Close section settings">
+            ×
+          </button>
+        </header>
+
+        <form class="settings-form" (submit)="updateSelectedSectionDetails($event)">
+          <label>
+            <span>Section name</span>
+            <input name="name" type="text" autocomplete="off" required [value]="settingsBaseline.name">
+          </label>
+          <button type="submit" [disabled]="updatingSection()">
+            {{ updatingSection() ? 'Saving' : 'Rename' }}
+          </button>
+        </form>
+
+        <form class="settings-form" (submit)="updateSelectedBaselineImage($event)">
+          <label class="file-field">
+            <span>Replace baseline image</span>
+            <input name="baselineImage" type="file" accept="image/png" required (change)="selectBaselineUpload($event)">
+            <small>{{ selectedBaselineImageName() || 'Choose a PNG image' }}</small>
+          </label>
+          <button type="submit" [disabled]="updatingBaseline()">
+            {{ updatingBaseline() ? 'Updating' : 'Replace' }}
+          </button>
+        </form>
+      </div>
+    </section>
+  }
+
+  @if (sectionFormOpen()) {
+    <section class="settings-overlay" role="dialog" aria-modal="true" aria-labelledby="add-section-title">
+      <div class="settings-modal add-section-modal">
+        <header class="settings-header">
+          <div>
+            <p class="eyebrow">New Section</p>
+            <h2 id="add-section-title">Add Section</h2>
+          </div>
+          <button class="settings-close-button" type="button" (click)="toggleSectionForm()" aria-label="Close add section form">
+            ×
+          </button>
+        </header>
+
+        <form class="section-form section-form--modal" (submit)="addSection($event)">
+          <label>
+            <span>Section name</span>
+            <input name="name" type="text" autocomplete="off" required placeholder="Checkout page">
+          </label>
+          <label>
+            <span>Page URL</span>
+            <input name="url" type="url" required [value]="selectedBaseline()?.targetUrl ?? selectedProject()?.targetUrl ?? ''" placeholder="https://example.com/page">
+          </label>
+          <label class="file-field">
+            <span>Baseline PNG</span>
+            <input name="baselineImage" type="file" accept="image/png" required (change)="selectSectionUpload($event)">
+            <small>{{ selectedSectionImageName() || 'Choose a PNG image' }}</small>
+          </label>
+          @if (sectionMessage() || sectionError()) {
+            <div class="section-status" [class.section-status--error]="sectionError()">
+              {{ sectionError() ?? sectionMessage() }}
+            </div>
+          }
+          <button type="submit" [disabled]="addingSection()">
+            {{ addingSection() ? 'Saving' : 'Save' }}
+          </button>
+        </form>
+      </div>
+    </section>
+  }
 </main>
+}

@@ -43,3 +43,10 @@ Run visual tests:
 ```sh
 npm run test:visual
 ```
+
+Run visual tests for a specific project or section:
+
+```sh
+npm run test:visual -- --project=visual-test-sample
+npm run test:visual -- --project=visual-test-sample --section=home-page
+```

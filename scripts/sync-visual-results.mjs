@@ -3,28 +3,35 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
+import {
+  defaultVisualProjectName,
+  defaultVisualProjectTargetUrl,
+  projectBaselineImageUrl,
+  projectRevisionManifestUrl,
+  projectSnapshotPath,
+  resolveVisualProject,
+} from './visual-projects.mjs';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const testResultsDir = path.join(rootDir, 'test-results');
-const visualPagesPath = path.join(rootDir, 'tests', 'visual-pages.json');
-const publicResultsDir = path.join(rootDir, 'public', 'visual-results');
-const revisionsDir = path.join(publicResultsDir, 'revisions');
-const latestManifestPath = path.join(publicResultsDir, 'manifest.json');
-const historyPath = path.join(publicResultsDir, 'history.json');
 const revisionRetention = 20;
 
-const defaultProject = {
-  id: 'home-page',
-  name: 'Home Page',
-  source: 'Visual Test Sample',
-  targetUrl: 'https://visual-test-sample.vercel.app/',
-  browser: 'Chromium',
-  viewport: '1440 x 900',
-  snapshotName: 'home-page.png',
-  baselineFileName: `home-page-chromium-${process.platform}.png`,
-  baselineImageUrl: `/assets/baselines/visual-test-sample/home-page-chromium-${process.platform}.png`,
-  snapshotPath: `tests/visual-test-sample.spec.ts-snapshots/home-page-chromium-${process.platform}.png`,
-};
+function defaultVisualPage(project) {
+  const baselineFileName = `home-page-chromium-${process.platform}.png`;
+
+  return {
+    id: 'home-page',
+    name: 'Home Page',
+    source: project.name ?? defaultVisualProjectName,
+    targetUrl: project.targetUrl ?? defaultVisualProjectTargetUrl,
+    browser: 'Chromium',
+    viewport: '1440 x 900',
+    snapshotName: 'home-page.png',
+    baselineFileName,
+    baselineImageUrl: projectBaselineImageUrl(project.id, baselineFileName),
+    snapshotPath: projectSnapshotPath(project.id, baselineFileName),
+  };
+}
 
 function revisionIdFromDate(date) {
   return date.toISOString().replace(/[:.]/g, '-');
@@ -136,8 +143,9 @@ async function readLastRunStatus() {
   return typeof lastRun?.status === 'string' ? lastRun.status : null;
 }
 
-async function readVisualPages(sectionId = null) {
-  const manifest = await readJson(visualPagesPath, null);
+async function readVisualPages(project, paths, sectionId = null) {
+  const fallbackPage = defaultVisualPage(project);
+  const manifest = await readJson(paths.visualPagesPath, null);
 
   if (Array.isArray(manifest?.pages) && manifest.pages.length > 0) {
     const pages = sectionId
@@ -149,16 +157,16 @@ async function readVisualPages(sectionId = null) {
     }
 
     return pages.map((page) => ({
-      ...defaultProject,
+      ...fallbackPage,
       ...page,
-      source: 'Visual Test Sample',
-      targetUrl: page.url ?? defaultProject.targetUrl,
+      source: project.name ?? defaultVisualProjectName,
+      targetUrl: page.url ?? project.targetUrl ?? fallbackPage.targetUrl,
       browser: 'Chromium',
       viewport: '1440 x 900',
     }));
   }
 
-  return [defaultProject];
+  return [fallbackPage];
 }
 
 async function captureCurrentScreenshot(visualPage, outputPath) {
@@ -202,8 +210,8 @@ async function captureCleanPageArtifacts(items) {
   }
 }
 
-async function readHistory() {
-  const history = await readJson(historyPath, null);
+async function readHistory(paths) {
+  const history = await readJson(paths.historyPath, null);
 
   if (Array.isArray(history?.revisions)) {
     return history.revisions;
@@ -212,29 +220,30 @@ async function readHistory() {
   return [];
 }
 
-async function pruneOldRevisions(revisions) {
+async function pruneOldRevisions(revisions, paths) {
   const retainedIds = new Set(revisions.map((revision) => revision.id));
 
-  if (!(await fileExists(revisionsDir))) {
+  if (!(await fileExists(paths.revisionsDir))) {
     return;
   }
 
-  const entries = await readdir(revisionsDir, { withFileTypes: true });
+  const entries = await readdir(paths.revisionsDir, { withFileTypes: true });
 
   await Promise.all(entries
     .filter((entry) => entry.isDirectory() && !retainedIds.has(entry.name))
-    .map((entry) => rm(path.join(revisionsDir, entry.name), { recursive: true, force: true })));
+    .map((entry) => rm(path.join(paths.revisionsDir, entry.name), { recursive: true, force: true })));
 }
 
 export async function syncVisualResults(options = {}) {
-  const visualPages = await readVisualPages(options.sectionId ?? null);
+  const { project, paths } = await resolveVisualProject(options.projectId ?? null);
+  const visualPages = await readVisualPages(project, paths, options.sectionId ?? null);
   const lastRunStatus = await readLastRunStatus();
   const testWasRun = typeof options.exitCode === 'number' || lastRunStatus !== null;
   const createdAt = new Date();
   const revisionId = options.revisionId ?? revisionIdFromDate(createdAt);
   const revisionUUID = options.uuid ?? randomUUID();
   const createdAtIso = createdAt.toISOString();
-  const revisionDir = path.join(revisionsDir, revisionId);
+  const revisionDir = path.join(paths.revisionsDir, revisionId);
   const items = [];
 
   await mkdir(revisionDir, { recursive: true });
@@ -255,9 +264,9 @@ export async function syncVisualResults(options = {}) {
     const hasDifferenceArtifacts = Boolean(actual && diff);
     const status = hasDifferenceArtifacts ? 'changed' : testWasRun ? 'clean' : 'baseline';
     const actualPath = path.join(pageDir, actualFileName);
-    const actualImageUrl = `/visual-results/revisions/${revisionId}/${visualPage.id}/${actualFileName}`;
+    const actualImageUrl = `/visual-results/${project.id}/revisions/${revisionId}/${visualPage.id}/${actualFileName}`;
     const diffPath = path.join(pageDir, diffFileName);
-    const diffImageUrl = `/visual-results/revisions/${revisionId}/${visualPage.id}/${diffFileName}`;
+    const diffImageUrl = `/visual-results/${project.id}/revisions/${revisionId}/${visualPage.id}/${diffFileName}`;
     const item = {
       ...visualPage,
       status,
@@ -301,7 +310,7 @@ export async function syncVisualResults(options = {}) {
   const changedPages = items.filter((item) => item.status === 'changed').length;
   const cleanPages = items.filter((item) => item.status === 'clean').length;
   const revisionStatus = changedPages > 0 ? 'changed' : testWasRun ? 'clean' : 'baseline';
-  const revisionManifestUrl = `/visual-results/revisions/${revisionId}/manifest.json`;
+  const revisionManifestUrl = projectRevisionManifestUrl(project.id, revisionId);
   const revisionManifest = {
     version: 1,
     revisionId,
@@ -310,7 +319,7 @@ export async function syncVisualResults(options = {}) {
     createdAt: createdAtIso,
     generatedAt: createdAtIso,
     label: revisionLabel(createdAtIso, revisionStatus),
-    targetUrl: visualPages[0]?.targetUrl ?? defaultProject.targetUrl,
+    targetUrl: visualPages[0]?.targetUrl ?? project.targetUrl ?? defaultVisualProjectTargetUrl,
     totalPages: items.length,
     changedPages,
     cleanPages,
@@ -328,7 +337,7 @@ export async function syncVisualResults(options = {}) {
     cleanPages,
     manifestUrl: revisionManifestUrl,
   };
-  const priorRevisions = await readHistory();
+  const priorRevisions = await readHistory(paths);
   const revisions = [
     revisionSummary,
     ...priorRevisions.filter((revision) => revision.id !== revisionId),
@@ -347,13 +356,22 @@ export async function syncVisualResults(options = {}) {
   };
 
   await writeJson(path.join(revisionDir, 'manifest.json'), revisionManifest);
-  await writeJson(historyPath, history);
-  await writeJson(latestManifestPath, latestManifest);
-  await pruneOldRevisions(revisions);
+  await writeJson(paths.historyPath, history);
+  await writeJson(paths.latestManifestPath, latestManifest);
+  await pruneOldRevisions(revisions, paths);
 
   return latestManifest;
 }
 
+function getArgValue(name) {
+  const prefix = `--${name}=`;
+  const match = process.argv.find((arg) => arg.startsWith(prefix));
+  return match ? match.slice(prefix.length) : null;
+}
+
 if (import.meta.url === `file://${process.argv[1]}`) {
-  await syncVisualResults();
+  await syncVisualResults({
+    projectId: getArgValue('project') ?? process.env.VISUAL_PROJECT_ID ?? null,
+    sectionId: getArgValue('section') ?? process.env.VISUAL_SECTION_ID ?? null,
+  });
 }

@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "defaultProjectId": "visual-test-sample",
+  "projects": [
+    {
+      "id": "visual-test-sample",
+      "name": "Visual Test Sample",
+      "targetUrl": "https://visual-test-sample.vercel.app/",
+      "createdAt": "2026-05-20T11:28:39.352Z",
+      "updatedAt": "2026-05-20T11:28:39.352Z"
+    }
+  ]
+}

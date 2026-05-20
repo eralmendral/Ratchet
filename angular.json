@@ -27,7 +27,7 @@
               },
               {
                 "glob": "**/*",
-                "input": "tests/visual-test-sample.spec.ts-snapshots",
+                "input": "tests/visual-projects/visual-test-sample/snapshots",
                 "output": "/assets/baselines/visual-test-sample"
               }
             ],
@@ -45,8 +45,8 @@
                 },
                 {
                   "type": "anyComponentStyle",
-                  "maximumWarning": "14kB",
-                  "maximumError": "18kB"
+                  "maximumWarning": "32kB",
+                  "maximumError": "36kB"
                 }
               ],
               "outputHashing": "all"

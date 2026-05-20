@@ -15,11 +15,12 @@ function getArgValue(name) {
 }
 
 const sectionId = getArgValue('section') ?? process.env.VISUAL_SECTION_ID ?? null;
+const projectId = getArgValue('project') ?? process.env.VISUAL_PROJECT_ID ?? null;
 const passthroughArgs = process.argv
   .slice(2)
-  .filter((arg) => !arg.startsWith('--section='));
+  .filter((arg) => !arg.startsWith('--section=') && !arg.startsWith('--project='));
 
-await crawlVisualBaselines({ update: updateSnapshots, sectionId });
+await crawlVisualBaselines({ update: updateSnapshots, sectionId, projectId });
 
 const args = [
   playwrightCli,
@@ -33,6 +34,7 @@ const testProcess = spawn(process.execPath, args, {
   stdio: 'inherit',
   env: {
     ...process.env,
+    ...(projectId ? { VISUAL_PROJECT_ID: projectId } : {}),
     ...(sectionId ? { VISUAL_SECTION_ID: sectionId } : {}),
   },
 });
@@ -41,7 +43,7 @@ testProcess.on('close', async (exitCode) => {
   const normalizedExitCode = exitCode ?? 1;
 
   try {
-    await syncVisualResults({ exitCode: normalizedExitCode, sectionId });
+    await syncVisualResults({ exitCode: normalizedExitCode, sectionId, projectId });
   } catch (error) {
     console.error('Failed to sync visual result artifacts:', error);
     process.exit(1);
