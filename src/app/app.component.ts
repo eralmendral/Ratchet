@@ -455,10 +455,10 @@ export class AppComponent implements OnInit, OnDestroy {
 
   async runSelectedSectionScan(): Promise<void> {
     const baseline = this.selectedBaseline();
-    await this.runVisualScanRequest(`/api/visual-sections/${encodeURIComponent(baseline.id)}/scan`);
+    await this.runVisualScanRequest(`/api/visual-sections/${encodeURIComponent(baseline.id)}/scan`, true);
   }
 
-  private async runVisualScanRequest(endpoint: string): Promise<void> {
+  private async runVisualScanRequest(endpoint: string, replaceSelectedSectionOnly = false): Promise<void> {
     if (this.scanning()) {
       return;
     }
@@ -492,7 +492,11 @@ export class AppComponent implements OnInit, OnDestroy {
         [scanPayload.manifest.revisionId ?? scanPayload.history.latestRevisionId ?? 'latest']: scanPayload.manifest,
       }));
       this.selectedRevisionId.set(scanPayload.manifest.revisionId ?? scanPayload.history.latestRevisionId ?? '');
-      this.applyManifest(scanPayload.manifest);
+      if (replaceSelectedSectionOnly && scanPayload.manifest.items.length === 1) {
+        this.replaceSection(scanPayload.manifest.items[0]);
+      } else {
+        this.applyManifest(scanPayload.manifest);
+      }
       await this.mergeAvailableSections();
       this.scanMessage.set(scanPayload.message);
       this.imageVersion.set(String(Date.now()));
@@ -705,6 +709,18 @@ export class AppComponent implements OnInit, OnDestroy {
           }
         : baseline);
     });
+  }
+
+  private replaceSection(section: VisualBaseline): void {
+    this.baselines.update((baselines) => {
+      const sectionIndex = baselines.findIndex((baseline) => baseline.id === section.id);
+      if (sectionIndex === -1) {
+        return [...baselines, section];
+      }
+
+      return baselines.map((baseline, index) => index === sectionIndex ? section : baseline);
+    });
+    this.selectedBaselineId.set(section.id);
   }
 
   private navigateTo(path: string, page: DashboardPage): void {
