@@ -1,0 +1,199 @@
+<main class="dashboard-shell">
+  <aside class="baseline-rail" aria-label="Original screenshot baselines">
+    <div class="rail-header">
+      <p class="eyebrow">Originals</p>
+    </div>
+
+    <div class="baseline-list">
+      @for (baseline of baselines(); track baseline.id) {
+        <button
+          class="baseline-card"
+          type="button"
+          [class.is-selected]="baseline.id === selectedBaseline().id"
+          [class.is-clean]="baseline.status === 'clean'"
+          [class.is-changed]="baseline.status === 'changed'"
+          (click)="selectBaseline(baseline.id)"
+        >
+          <img [src]="imageSrc(baseline.baselineImageUrl)" [alt]="baseline.source + ' ' + baseline.name + ' baseline screenshot'">
+          <span>
+            <strong>{{ cardTitle(baseline) }}</strong>
+            <small>{{ cardDescription(baseline) }}</small>
+          </span>
+        </button>
+      }
+    </div>
+  </aside>
+
+  <section class="comparison-workspace" aria-label="Visual comparison workspace">
+    @if (selectedBaseline(); as baseline) {
+      <header class="workspace-header">
+        <div>
+          <p class="eyebrow">{{ pageEyebrow() }}</p>
+          <h1>{{ pageHeading() }}</h1>
+        </div>
+        <div class="workspace-actions">
+          @if (currentPage() === 'history') {
+            <button class="nav-button nav-button--secondary" type="button" (click)="goToDashboard()">
+              Screenshot Comparison
+            </button>
+          } @else {
+            <button class="nav-button nav-button--secondary" type="button" (click)="goToHistory()">
+              Reports / History
+            </button>
+            <a class="target-link" [href]="baseline.targetUrl" target="_blank" rel="noreferrer">
+              Open Target
+            </a>
+          }
+          <button class="scan-button" type="button" [disabled]="scanning()" (click)="runVisualScan()">
+            {{ scanning() ? 'Scanning...' : 'Run visual scan' }}
+          </button>
+        </div>
+      </header>
+
+      @if (scanMessage() || scanError()) {
+        <section class="scan-status" [class.scan-status--error]="scanError()">
+          {{ scanError() ?? scanMessage() }}
+        </section>
+      }
+
+      @if (currentPage() === 'dashboard') {
+        <section class="comparison-grid">
+          <article class="preview-panel original-panel">
+            <div class="panel-heading">
+              <span>Original Baseline</span>
+              <small>{{ baseline.browser }} · {{ baseline.viewport }}</small>
+            </div>
+            <div class="image-frame">
+              <img [src]="imageSrc(baseline.baselineImageUrl)" [alt]="baseline.source + ' original baseline screenshot'">
+            </div>
+          </article>
+
+          <article class="preview-panel artifact-panel">
+            <div class="panel-heading">
+              <span>Current Run</span>
+              <small>Actual screenshot</small>
+            </div>
+            @if (artifactAvailable(baseline.actualImageUrl)) {
+              <div class="image-frame artifact-frame">
+                <img
+                  [src]="imageSrc(baseline.actualImageUrl)"
+                  [alt]="baseline.source + ' current run screenshot'"
+                  (error)="markArtifactUnavailable(baseline.actualImageUrl)"
+                >
+              </div>
+            } @else {
+              <div class="empty-state">
+                <strong>{{ statusLabel(baseline.status) }}</strong>
+                <span>Actual artifact unavailable</span>
+              </div>
+            }
+          </article>
+
+          <article class="preview-panel artifact-panel diff-panel">
+            <div class="panel-heading">
+              <span>Diff</span>
+              <small>Pixel delta</small>
+            </div>
+            @if (artifactAvailable(baseline.diffImageUrl)) {
+              <div class="image-frame artifact-frame">
+                <img
+                  [src]="imageSrc(baseline.diffImageUrl)"
+                  [alt]="baseline.source + ' visual difference screenshot'"
+                  (error)="markArtifactUnavailable(baseline.diffImageUrl)"
+                >
+              </div>
+            } @else {
+              <div class="empty-state">
+                <strong>{{ statusLabel(baseline.status) }}</strong>
+                <span>Diff artifact unavailable</span>
+              </div>
+            }
+          </article>
+        </section>
+      }
+
+      @if (currentPage() === 'history') {
+        @if (selectedRevision(); as revision) {
+          <section class="revision-panel" aria-label="Visual revision history">
+            <div class="revision-current">
+              <p class="eyebrow">Selected Revision</p>
+              <h3>{{ revisionDisplayLabel(revision) }}</h3>
+              <span>{{ revisionSummary(revision) }}</span>
+              <span>UUID: {{ revisionUUID(revision) }}</span>
+              <span>Date: {{ revisionDateTime(revision) }}</span>
+              <div class="revision-actions">
+                @if (canAcceptSelectedPage()) {
+                  <button type="button" [disabled]="acceptingRevision()" (click)="acceptSelectedPage()">
+                    {{ acceptingRevision() ? 'Accepting page...' : 'Accept this page as baseline' }}
+                  </button>
+                }
+                <button class="accept-all-action" type="button" [disabled]="!canAcceptAllRevision() || acceptingAll()" (click)="acceptAllChangedPages()">
+                  {{ acceptingAll() ? 'Accepting all...' : 'Accept all changed pages' }}
+                </button>
+                <small>{{ acceptMessage() ?? acceptError() ?? approvalHint() }}</small>
+              </div>
+            </div>
+
+            <div class="revision-list" aria-label="Recent visual revisions">
+              @for (item of revisions(); track item.id) {
+                <button
+                  type="button"
+                  class="revision-card"
+                  [class.is-selected]="item.id === revision.id"
+                  [class.is-changed]="item.status === 'changed'"
+                  [class.is-clean]="item.status === 'clean'"
+                  [class.is-accepted]="item.status === 'accepted'"
+                  (click)="selectRevision(item.id)"
+                >
+                  <strong>{{ revisionDisplayLabel(item) }}</strong>
+                  <small>{{ revisionSummary(item) }}</small>
+                </button>
+              }
+            </div>
+          </section>
+        }
+
+        <section class="report-panel" [class.report-panel--changed]="baseline.status === 'changed'">
+          <div>
+            <p class="eyebrow">Plain Language Report</p>
+            <h3>{{ reportTitle(baseline) }}</h3>
+            <p>{{ reportDescription(baseline) }}</p>
+          </div>
+          <div class="error-location">
+            <span>{{ locationLabel(baseline) }}</span>
+            <strong>{{ errorLocation(baseline) }}</strong>
+          </div>
+        </section>
+
+        <section class="metadata-strip" aria-label="Selected baseline details">
+          @if (selectedRevision(); as revision) {
+            <div>
+              <span>Revision UUID</span>
+              <strong>{{ revisionUUID(revision) }}</strong>
+            </div>
+            <div>
+              <span>Revision Date</span>
+              <strong>{{ revisionDateTime(revision) }}</strong>
+            </div>
+          }
+          <div>
+            <span>Approved Baseline</span>
+            <strong>{{ baseline.snapshotPath }}</strong>
+          </div>
+          <div>
+            <span>History Snapshot</span>
+            <strong>{{ historySnapshotPath(selectedRevision(), baseline) }}</strong>
+          </div>
+          <div>
+            <span>Diff Snapshot</span>
+            <strong>{{ diffSnapshotPath(baseline) }}</strong>
+          </div>
+          <div>
+            <span>Status</span>
+            <strong>{{ statusLabel(baseline.status) }}</strong>
+          </div>
+        </section>
+      }
+    }
+  </section>
+</main>

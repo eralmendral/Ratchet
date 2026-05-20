@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "targetUrl": "https://visual-test-sample.vercel.app/",
+  "generatedAt": "2026-05-20T10:47:42.467Z",
+  "pages": [
+    {
+      "id": "home-page",
+      "name": "Visual regression sample targets",
+      "path": "/",
+      "url": "https://visual-test-sample.vercel.app/",
+      "snapshotName": "home-page.png",
+      "baselineFileName": "home-page-chromium-darwin.png",
+      "baselineImageUrl": "/assets/baselines/visual-test-sample/home-page-chromium-darwin.png",
+      "snapshotPath": "tests/visual-test-sample.spec.ts-snapshots/home-page-chromium-darwin.png"
+    },
+    {
+      "id": "box-grid-page",
+      "name": "Box Grid Target",
+      "path": "/pages/box-grid.html",
+      "url": "https://visual-test-sample.vercel.app/pages/box-grid.html",
+      "snapshotName": "box-grid-page.png",
+      "baselineFileName": "box-grid-page-chromium-darwin.png",
+      "baselineImageUrl": "/assets/baselines/visual-test-sample/box-grid-page-chromium-darwin.png",
+      "snapshotPath": "tests/visual-test-sample.spec.ts-snapshots/box-grid-page-chromium-darwin.png"
+    },
+    {
+      "id": "dashboard-page",
+      "name": "Operations Dashboard",
+      "path": "/pages/dashboard.html",
+      "url": "https://visual-test-sample.vercel.app/pages/dashboard.html",
+      "snapshotName": "dashboard-page.png",
+      "baselineFileName": "dashboard-page-chromium-darwin.png",
+      "baselineImageUrl": "/assets/baselines/visual-test-sample/dashboard-page-chromium-darwin.png",
+      "snapshotPath": "tests/visual-test-sample.spec.ts-snapshots/dashboard-page-chromium-darwin.png"
+    }
+  ]
+}

@@ -1,0 +1,46 @@
+{
+  "name": "ratchet",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "npm run build && go run ./cmd/visual-server",
+    "start:angular": "ng serve --proxy-config proxy.conf.json",
+    "backend": "go run ./cmd/visual-server",
+    "build": "ng build",
+    "baseline:crawl": "node scripts/crawl-visual-baselines.mjs",
+    "baseline:crawl:update": "node scripts/crawl-visual-baselines.mjs --update",
+    "test": "playwright test",
+    "test:visual": "node scripts/run-visual-test.mjs",
+    "test:visual:update": "node scripts/run-visual-test.mjs --update-snapshots"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/eralmendral/Ratchet.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/eralmendral/Ratchet/issues"
+  },
+  "homepage": "https://github.com/eralmendral/Ratchet#readme",
+  "dependencies": {
+    "@angular/common": "21.2.11",
+    "@angular/compiler": "21.2.11",
+    "@angular/core": "21.2.11",
+    "@angular/platform-browser": "21.2.11",
+    "rxjs": "^7.8.0",
+    "tslib": "^2.8.0",
+    "zone.js": "~0.16.0"
+  },
+  "devDependencies": {
+    "@angular/build": "21.2.11",
+    "@angular/cli": "21.2.11",
+    "@angular/compiler-cli": "21.2.11",
+    "@playwright/test": "^1.60.0",
+    "@types/node": "^25.9.1",
+    "typescript": "~5.9.3"
+  }
+}
