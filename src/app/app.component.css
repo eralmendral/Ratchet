@@ -325,8 +325,9 @@
   bottom: 24px;
   left: 24px;
   z-index: 20;
-  display: grid;
-  grid-template-columns: 1fr auto;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   width: min(312px, calc(100vw - 48px));
 }
@@ -339,11 +340,9 @@
   border: 1px solid #111111;
 }
 
-.rail-primary-action {
-  min-width: 84px;
-}
-
+.rail-primary-action,
 .rail-secondary-action {
+  flex: 1 1 auto;
   min-width: 0;
 }
 
@@ -535,14 +534,6 @@
   min-width: 0;
   overflow: auto;
   padding: 24px;
-}
-
-.workspace-actions {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-  flex-wrap: wrap;
 }
 
 .target-link,
@@ -1259,63 +1250,43 @@
   line-height: 1.45;
 }
 
-.scan-animation {
+.scan-progress-meter {
   position: relative;
-  display: grid;
-  gap: 12px;
-  padding: 20px;
+  height: 10px;
   overflow: hidden;
-  background: #f8fafc;
-  border: 1px solid #dbe3ea;
+  background: #e9eef3;
+  border: 1px solid #d6dde6;
+  border-radius: 999px;
+}
+
+.scan-progress-meter span {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 42%;
+  background: linear-gradient(90deg, #1f8a70, #3aa98c, #1f8a70);
+  border-radius: inherit;
+  animation: scan-progress-slide 1.05s ease-in-out infinite;
+}
+
+.scan-progress-log {
+  display: grid;
+  gap: 6px;
+  max-height: 156px;
+  padding: 12px;
+  overflow: hidden;
+  color: #243142;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 0.76rem;
+  line-height: 1.35;
+  background: #f6f8fa;
+  border: 1px solid #dce3ea;
   border-radius: 8px;
 }
 
-.scan-animation::before {
-  position: absolute;
-  inset: 0 auto 0 -35%;
-  width: 35%;
-  content: "";
-  background: linear-gradient(90deg, transparent, rgba(31, 138, 112, 0.22), transparent);
-  animation: scan-sweep 1.3s linear infinite;
-}
-
-.scan-animation span,
-.scan-skeleton span {
-  display: block;
-  height: 16px;
-  background: linear-gradient(90deg, #e8eef4, #f8fafc, #e8eef4);
-  background-size: 220% 100%;
-  border-radius: 999px;
-  animation: scan-shimmer 1.15s ease-in-out infinite;
-}
-
-.scan-animation span:nth-child(1) {
-  width: 72%;
-}
-
-.scan-animation span:nth-child(2) {
-  width: 92%;
-}
-
-.scan-animation span:nth-child(3) {
-  width: 54%;
-}
-
-.scan-skeleton {
-  display: grid;
-  gap: 10px;
-}
-
-.scan-skeleton span:nth-child(1) {
-  width: 100%;
-}
-
-.scan-skeleton span:nth-child(2) {
-  width: 82%;
-}
-
-.scan-skeleton span:nth-child(3) {
-  width: 64%;
+.scan-progress-log span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .cancel-scan-button {
@@ -1344,19 +1315,17 @@
   cursor: wait;
 }
 
-@keyframes scan-sweep {
-  to {
-    transform: translateX(390%);
-  }
-}
-
-@keyframes scan-shimmer {
+@keyframes scan-progress-slide {
   0% {
-    background-position: 120% 0;
+    transform: translateX(-105%);
+  }
+
+  50% {
+    transform: translateX(72%);
   }
 
   100% {
-    background-position: -120% 0;
+    transform: translateX(245%);
   }
 }
 
@@ -1419,12 +1388,6 @@
 
   .workspace-header {
     display: grid;
-  }
-
-  .workspace-actions {
-    display: grid;
-    justify-items: start;
-    width: 100%;
   }
 
   .scan-button,

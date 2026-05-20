@@ -20,7 +20,9 @@ const passthroughArgs = process.argv
   .slice(2)
   .filter((arg) => !arg.startsWith('--section=') && !arg.startsWith('--project='));
 
-await crawlVisualBaselines({ update: updateSnapshots, sectionId, projectId });
+console.log('[ratchet] Preparing visual baselines.');
+await crawlVisualBaselines({ update: updateSnapshots, sectionId, projectId, discover: false });
+console.log('[ratchet] Running Playwright visual comparisons.');
 
 const args = [
   playwrightCli,
@@ -43,6 +45,7 @@ testProcess.on('close', async (exitCode) => {
   const normalizedExitCode = exitCode ?? 1;
 
   try {
+    console.log('[ratchet] Syncing visual result artifacts.');
     await syncVisualResults({ exitCode: normalizedExitCode, sectionId, projectId });
   } catch (error) {
     console.error('Failed to sync visual result artifacts:', error);

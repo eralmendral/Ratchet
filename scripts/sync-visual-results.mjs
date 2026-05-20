@@ -15,6 +15,8 @@ import {
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const testResultsDir = path.join(rootDir, 'test-results');
 const revisionRetention = 20;
+const currentScreenshotConcurrency = 4;
+const chromeExecutablePath = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 
 function defaultVisualPage(project) {
   const baselineFileName = `home-page-chromium-${process.platform}.png`;
@@ -169,18 +171,14 @@ async function readVisualPages(project, paths, sectionId = null) {
   return [fallbackPage];
 }
 
-async function captureCurrentScreenshot(visualPage, outputPath) {
-  const browser = await chromium.launch();
+async function captureCurrentScreenshot(browser, visualPage, outputPath) {
+  const page = await browser.newPage({
+    viewport: { width: 1440, height: 900 },
+    deviceScaleFactor: 1,
+  });
 
   try {
-    const page = await browser.newPage({
-      viewport: { width: 1440, height: 900 },
-      deviceScaleFactor: 1,
-    });
-
-    await page.goto(visualPage.targetUrl, { waitUntil: 'networkidle' });
-    await page.locator('body').waitFor({ state: 'visible' });
-    await page.evaluate(() => document.fonts.ready);
+    await openVisualPageState(page, visualPage.targetUrl, visualPage.actions);
     await page.screenshot({
       path: outputPath,
       fullPage: true,
@@ -188,26 +186,111 @@ async function captureCurrentScreenshot(visualPage, outputPath) {
       caret: 'hide',
     });
   } finally {
+    await page.close();
+  }
+}
+
+async function openVisualPageState(page, targetUrl, actions = []) {
+  await gotoWithRetry(page, targetUrl);
+  await waitForPageReady(page);
+
+  for (const action of actions) {
+    await replayVisualAction(page, action);
+  }
+}
+
+async function gotoWithRetry(page, targetUrl) {
+  try {
+    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  } catch {
+    await page.waitForTimeout(1000);
+    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  }
+}
+
+async function replayVisualAction(page, action) {
+  if (action.type !== 'click' || !action.selector) {
+    return;
+  }
+
+  const locator = action.text
+    ? page.locator(action.selector).filter({ hasText: action.text }).first()
+    : page.locator(action.selector).nth(action.index ?? 0);
+
+  await locator.waitFor({ state: 'visible', timeout: 5000 });
+  await locator.click({ timeout: 5000 });
+  await waitForPageReady(page);
+}
+
+async function waitForPageReady(page) {
+  await page.locator('body').waitFor({ state: 'visible' });
+  await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => null);
+  await page.evaluate(() => document.fonts?.ready).catch(() => null);
+  await page.waitForFunction(() => {
+    const body = document.body;
+    const root = document.documentElement;
+    const signature = [
+      body?.innerText?.length ?? 0,
+      body?.querySelectorAll('*')?.length ?? 0,
+      root?.scrollWidth ?? 0,
+      root?.scrollHeight ?? 0,
+    ].join(':');
+    const state = window.__ratchetVisualStableState ?? { signature: '', count: 0 };
+
+    if (state.signature === signature) {
+      state.count += 1;
+    } else {
+      state.signature = signature;
+      state.count = 0;
+    }
+
+    window.__ratchetVisualStableState = state;
+    return state.count >= 2;
+  }, null, { polling: 200, timeout: 3000 }).catch(() => null);
+}
+
+async function captureCleanPageArtifacts(items) {
+  const pendingItems = items.filter((item) => item.status === 'clean' && !item.actualImageUrl);
+
+  if (pendingItems.length === 0) {
+    return;
+  }
+
+  const browser = await chromium.launch({ executablePath: chromeExecutablePath });
+
+  try {
+    await runWithConcurrency(pendingItems, currentScreenshotConcurrency, async (item) => {
+      try {
+        await captureCurrentScreenshot(browser, item, path.join(rootDir, item.actualPath));
+        item.actualImageUrl = item.pendingActualImageUrl;
+      } catch (error) {
+        console.warn(`Could not capture current screenshot for ${item.name}:`, error.message);
+        item.actualPath = null;
+      } finally {
+        delete item.pendingActualImageUrl;
+      }
+    });
+  } finally {
     await browser.close();
   }
 }
 
-async function captureCleanPageArtifacts(items) {
-  for (const item of items) {
-    if (item.status !== 'clean' || item.actualImageUrl) {
-      continue;
-    }
+async function runWithConcurrency(items, concurrency, worker) {
+  let nextIndex = 0;
+  const workerCount = Math.max(1, Math.min(concurrency, items.length));
 
-    try {
-      await captureCurrentScreenshot(item, path.join(rootDir, item.actualPath));
-      item.actualImageUrl = item.pendingActualImageUrl;
-    } catch (error) {
-      console.warn(`Could not capture current screenshot for ${item.name}:`, error.message);
-      item.actualPath = null;
-    } finally {
-      delete item.pendingActualImageUrl;
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    for (;;) {
+      const index = nextIndex;
+      nextIndex += 1;
+
+      if (index >= items.length) {
+        return;
+      }
+
+      await worker(items[index]);
     }
-  }
+  }));
 }
 
 async function readHistory(paths) {

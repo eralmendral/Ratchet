@@ -27,7 +27,7 @@
               },
               {
                 "glob": "**/*",
-                "input": "tests/visual-projects/visual-test-sample/snapshots",
+                "input": "tests/visual-test-sample.spec.ts-snapshots",
                 "output": "/assets/baselines/visual-test-sample"
               }
             ],

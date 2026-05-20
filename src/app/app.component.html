@@ -112,6 +112,18 @@
     </div>
 
     <div class="rail-edit-panel">
+      <button class="rail-secondary-action" type="button" (click)="goToDashboard()">
+        Projects
+      </button>
+      @if (currentPage() === 'snapshots') {
+        <button class="rail-secondary-action" type="button" (click)="goToWorkspace()">
+          Workspace
+        </button>
+      } @else {
+        <button class="rail-secondary-action" type="button" (click)="goToSnapshots()">
+          Snapshots
+        </button>
+      }
       @if (editingSections()) {
         <button class="rail-secondary-action" type="button" (click)="toggleSectionForm()">
           Add Section
@@ -131,23 +143,6 @@
           <p class="eyebrow">{{ pageEyebrow() }}</p>
           @if (pageHeading(); as heading) {
             <h1>{{ heading }}</h1>
-          }
-        </div>
-        <div class="workspace-actions">
-          @if (currentPage() === 'snapshots') {
-            <button class="nav-button nav-button--secondary" type="button" (click)="goToDashboard()">
-              Projects
-            </button>
-            <button class="nav-button nav-button--secondary" type="button" (click)="goToWorkspace()">
-              Workspace
-            </button>
-          } @else {
-            <button class="nav-button nav-button--secondary" type="button" (click)="goToDashboard()">
-              Projects
-            </button>
-            <button class="nav-button nav-button--secondary" type="button" (click)="goToSnapshots()">
-              Snapshots
-            </button>
           }
         </div>
       </header>
@@ -333,11 +328,6 @@
           <p class="eyebrow">{{ selectedProject()?.name ?? 'Project' }}</p>
           <h1>No Sections</h1>
         </div>
-        <div class="workspace-actions">
-          <button class="nav-button nav-button--secondary" type="button" (click)="goToDashboard()">
-            Projects
-          </button>
-        </div>
       </header>
 
       @if (scanMessage() || scanError() || sectionMessage() || sectionError()) {
@@ -366,21 +356,21 @@
   @if (scanning()) {
     <section class="scan-overlay" role="alertdialog" aria-modal="true" aria-labelledby="scan-overlay-title">
       <div class="scan-modal">
-        <div class="scan-animation" aria-hidden="true">
-          <span></span>
-          <span></span>
-          <span></span>
-        </div>
         <div>
           <p class="eyebrow">{{ jobEyebrow() }}</p>
           <h2 id="scan-overlay-title">{{ jobTitle() }}</h2>
           <p>{{ jobDescription() }}</p>
         </div>
-        <div class="scan-skeleton" aria-hidden="true">
-          <span></span>
-          <span></span>
+        <div class="scan-progress-meter" aria-hidden="true">
           <span></span>
         </div>
+        @if (scanProgressLines().length) {
+          <div class="scan-progress-log" aria-label="Scan progress log">
+            @for (line of scanProgressLines(); track line) {
+              <span>{{ line }}</span>
+            }
+          </div>
+        }
         <button class="cancel-scan-button" type="button" [disabled]="cancelingScan()" (click)="cancelVisualScan()">
           {{ cancelingScan() ? 'Canceling' : 'Cancel' }}
         </button>

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -87,41 +88,51 @@ type visualPagesManifest struct {
 	Pages       []visualPage `json:"pages"`
 }
 
+type visualAction struct {
+	Type     string `json:"type"`
+	Selector string `json:"selector"`
+	Index    int    `json:"index,omitempty"`
+	Text     string `json:"text,omitempty"`
+	Label    string `json:"label,omitempty"`
+}
+
 type visualPage struct {
-	ID               string `json:"id"`
-	Name             string `json:"name"`
-	Path             string `json:"path"`
-	URL              string `json:"url"`
-	SnapshotName     string `json:"snapshotName"`
-	BaselineFileName string `json:"baselineFileName"`
-	BaselineImageURL string `json:"baselineImageUrl"`
-	SnapshotPath     string `json:"snapshotPath"`
-	ManualBaseline   bool   `json:"manualBaseline,omitempty"`
+	ID               string         `json:"id"`
+	Name             string         `json:"name"`
+	Path             string         `json:"path"`
+	URL              string         `json:"url"`
+	SnapshotName     string         `json:"snapshotName"`
+	BaselineFileName string         `json:"baselineFileName"`
+	BaselineImageURL string         `json:"baselineImageUrl"`
+	SnapshotPath     string         `json:"snapshotPath"`
+	ManualBaseline   bool           `json:"manualBaseline,omitempty"`
+	Actions          []visualAction `json:"actions,omitempty"`
 }
 
 type visualItem struct {
-	ID               string       `json:"id"`
-	Name             string       `json:"name"`
-	Source           string       `json:"source"`
-	TargetURL        string       `json:"targetUrl"`
-	Browser          string       `json:"browser"`
-	Viewport         string       `json:"viewport"`
-	SnapshotName     string       `json:"snapshotName"`
-	BaselineFileName string       `json:"baselineFileName"`
-	BaselineImageURL string       `json:"baselineImageUrl"`
-	SnapshotPath     string       `json:"snapshotPath"`
-	Path             string       `json:"path"`
-	URL              string       `json:"url"`
-	Status           visualStatus `json:"status"`
-	GeneratedAt      string       `json:"generatedAt"`
-	RevisionID       string       `json:"revisionId"`
-	ActualImageURL   *string      `json:"actualImageUrl"`
-	DiffImageURL     *string      `json:"diffImageUrl"`
-	ActualPath       *string      `json:"actualPath"`
-	DiffPath         *string      `json:"diffPath"`
-	ErrorContextPath *string      `json:"errorContextPath"`
-	Summary          string       `json:"summary"`
-	Description      string       `json:"description"`
+	ID               string         `json:"id"`
+	Name             string         `json:"name"`
+	Source           string         `json:"source"`
+	TargetURL        string         `json:"targetUrl"`
+	Browser          string         `json:"browser"`
+	Viewport         string         `json:"viewport"`
+	SnapshotName     string         `json:"snapshotName"`
+	BaselineFileName string         `json:"baselineFileName"`
+	BaselineImageURL string         `json:"baselineImageUrl"`
+	SnapshotPath     string         `json:"snapshotPath"`
+	Path             string         `json:"path"`
+	URL              string         `json:"url"`
+	Status           visualStatus   `json:"status"`
+	GeneratedAt      string         `json:"generatedAt"`
+	RevisionID       string         `json:"revisionId"`
+	ActualImageURL   *string        `json:"actualImageUrl"`
+	DiffImageURL     *string        `json:"diffImageUrl"`
+	ActualPath       *string        `json:"actualPath"`
+	DiffPath         *string        `json:"diffPath"`
+	ErrorContextPath *string        `json:"errorContextPath"`
+	Summary          string         `json:"summary"`
+	Description      string         `json:"description"`
+	Actions          []visualAction `json:"actions,omitempty"`
 }
 
 type revisionManifest struct {
@@ -178,6 +189,13 @@ type scanResponse struct {
 	Manifest revisionManifest `json:"manifest"`
 }
 
+type scanStatusResponse struct {
+	Running   bool   `json:"running"`
+	Message   string `json:"message"`
+	Output    string `json:"output"`
+	UpdatedAt string `json:"updatedAt,omitempty"`
+}
+
 type sectionResponse struct {
 	Message  string           `json:"message"`
 	Section  visualItem       `json:"section"`
@@ -196,10 +214,11 @@ type sectionRefreshResponse struct {
 }
 
 type server struct {
-	rootDir   string
-	staticDir string
-	scanMu    sync.Mutex
-	scanning  bool
+	rootDir    string
+	staticDir  string
+	scanMu     sync.Mutex
+	scanning   bool
+	scanStatus scanStatusResponse
 }
 
 func main() {
@@ -220,6 +239,7 @@ func main() {
 	mux.HandleFunc("/api/health", s.handleHealth)
 	mux.HandleFunc("/api/projects", s.handleProjects)
 	mux.HandleFunc("/api/projects/", s.handleProject)
+	mux.HandleFunc("/api/visual-scan/status", s.handleVisualScanStatus)
 	mux.HandleFunc("/api/visual-scan", s.handleVisualScan)
 	mux.HandleFunc("/api/visual-revisions/", s.handleVisualRevision)
 	mux.HandleFunc("/api/visual-sections", s.handleVisualSections)
@@ -481,6 +501,15 @@ func (s *server) handleVisualScan(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, response)
 }
 
+func (s *server) handleVisualScanStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "Only GET is supported.")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, s.visualJobStatus())
+}
+
 func (s server) handleVisualRevision(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "Only POST is supported.")
@@ -628,7 +657,7 @@ func (s server) handleStatic(w http.ResponseWriter, r *http.Request) {
 var errScanAlreadyRunning = errors.New("A visual scan is already running.")
 
 func (s *server) runVisualScan(ctx context.Context, project projectContext, sectionID string) (scanResponse, error) {
-	if err := s.beginVisualJob(); err != nil {
+	if err := s.beginVisualJob(fmt.Sprintf("Starting visual scan for %s.", project.Project.Name)); err != nil {
 		return scanResponse{}, err
 	}
 	defer s.finishVisualJob()
@@ -637,11 +666,9 @@ func (s *server) runVisualScan(ctx context.Context, project projectContext, sect
 	if sectionID != "" {
 		commandArgs = append(commandArgs, "--section="+sectionID)
 	}
-
 	command := exec.CommandContext(ctx, "npm", commandArgs...)
 	command.Dir = s.rootDir
-	outputBytes, err := command.CombinedOutput()
-	output := string(outputBytes)
+	output, err := s.runCommandWithProgress(command)
 	exitCode := 0
 
 	if err != nil {
@@ -687,7 +714,7 @@ func (s *server) runVisualScan(ctx context.Context, project projectContext, sect
 }
 
 func (s *server) runVisualSectionsRefresh(ctx context.Context, project projectContext, update bool) (sectionRefreshResponse, error) {
-	if err := s.beginVisualJob(); err != nil {
+	if err := s.beginVisualJob(fmt.Sprintf("Refreshing sections for %s.", project.Project.Name)); err != nil {
 		return sectionRefreshResponse{}, err
 	}
 	defer s.finishVisualJob()
@@ -696,11 +723,9 @@ func (s *server) runVisualSectionsRefresh(ctx context.Context, project projectCo
 	if update {
 		commandArgs = append(commandArgs, "--update")
 	}
-
 	command := exec.CommandContext(ctx, "node", commandArgs...)
 	command.Dir = s.rootDir
-	outputBytes, err := command.CombinedOutput()
-	output := string(outputBytes)
+	output, err := s.runCommandWithProgress(command)
 
 	if err != nil {
 		if errors.Is(ctx.Err(), context.Canceled) {
@@ -732,7 +757,7 @@ func (s *server) runVisualSectionsRefresh(ctx context.Context, project projectCo
 	}, nil
 }
 
-func (s *server) beginVisualJob() error {
+func (s *server) beginVisualJob(message string) error {
 	s.scanMu.Lock()
 	defer s.scanMu.Unlock()
 
@@ -740,13 +765,126 @@ func (s *server) beginVisualJob() error {
 		return errScanAlreadyRunning
 	}
 	s.scanning = true
+	s.scanStatus = scanStatusResponse{
+		Running:   true,
+		Message:   message,
+		Output:    "",
+		UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}
 	return nil
 }
 
 func (s *server) finishVisualJob() {
 	s.scanMu.Lock()
 	s.scanning = false
+	s.scanStatus.Running = false
+	s.scanStatus.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	s.scanMu.Unlock()
+}
+
+func (s *server) visualJobStatus() scanStatusResponse {
+	s.scanMu.Lock()
+	defer s.scanMu.Unlock()
+
+	return s.scanStatus
+}
+
+func (s *server) appendVisualJobOutput(line string) {
+	cleanLine := strings.TrimSpace(stripTerminalControls(line))
+	if cleanLine == "" {
+		return
+	}
+
+	s.scanMu.Lock()
+	defer s.scanMu.Unlock()
+
+	const maxOutputBytes = 12000
+	if s.scanStatus.Output == "" {
+		s.scanStatus.Output = cleanLine
+	} else {
+		s.scanStatus.Output += "\n" + cleanLine
+	}
+	if len(s.scanStatus.Output) > maxOutputBytes {
+		s.scanStatus.Output = s.scanStatus.Output[len(s.scanStatus.Output)-maxOutputBytes:]
+		if firstNewline := strings.IndexByte(s.scanStatus.Output, '\n'); firstNewline >= 0 {
+			s.scanStatus.Output = s.scanStatus.Output[firstNewline+1:]
+		}
+	}
+
+	s.scanStatus.Message = cleanLine
+	s.scanStatus.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+}
+
+func (s *server) runCommandWithProgress(command *exec.Cmd) (string, error) {
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		return "", err
+	}
+	stderr, err := command.StderrPipe()
+	if err != nil {
+		return "", err
+	}
+
+	var outputMu sync.Mutex
+	var output strings.Builder
+	recordLine := func(line string) {
+		outputMu.Lock()
+		output.WriteString(line)
+		output.WriteByte('\n')
+		outputMu.Unlock()
+		s.appendVisualJobOutput(line)
+	}
+	readPipe := func(reader io.Reader, done chan<- struct{}) {
+		defer close(done)
+		scanner := bufio.NewScanner(reader)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for scanner.Scan() {
+			recordLine(scanner.Text())
+		}
+	}
+
+	if err := command.Start(); err != nil {
+		return "", err
+	}
+
+	stdoutDone := make(chan struct{})
+	stderrDone := make(chan struct{})
+	go readPipe(stdout, stdoutDone)
+	go readPipe(stderr, stderrDone)
+
+	err = command.Wait()
+	<-stdoutDone
+	<-stderrDone
+
+	outputMu.Lock()
+	result := output.String()
+	outputMu.Unlock()
+
+	return result, err
+}
+
+func stripTerminalControls(value string) string {
+	var builder strings.Builder
+	skippingEscape := false
+
+	for _, character := range value {
+		if skippingEscape {
+			if (character >= 'A' && character <= 'Z') || (character >= 'a' && character <= 'z') {
+				skippingEscape = false
+			}
+			continue
+		}
+		if character == '\x1b' {
+			skippingEscape = true
+			continue
+		}
+		if character < 32 && character != '\t' {
+			continue
+		}
+		builder.WriteRune(character)
+	}
+
+	return builder.String()
 }
 
 func (s server) projectFromRequest(r *http.Request) (projectContext, error) {
@@ -1921,6 +2059,7 @@ func visualPageToItem(project visualProject, page visualPage, generatedAt string
 		GeneratedAt:      generatedAt,
 		Summary:          page.Name + " baseline is ready.",
 		Description:      "This screenshot is the original approved image used for future comparisons.",
+		Actions:          page.Actions,
 	}
 }
 

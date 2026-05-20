@@ -14,3 +14,5 @@ node_modules/
 
 # Visual scan generated output
 /public/visual-results/
+/tests/visual-projects.json
+/tests/visual-projects/

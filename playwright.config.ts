@@ -1,5 +1,7 @@
 import { defineConfig, devices } from '@playwright/test';
 
+const chromeExecutablePath = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+
 /**
  * Read environment variables from file.
  * https://github.com/motdotla/dotenv
@@ -45,7 +47,12 @@ export default defineConfig({
   projects: [
     {
       name: 'chromium',
-      use: { ...devices['Desktop Chrome'] },
+      use: {
+        ...devices['Desktop Chrome'],
+        launchOptions: {
+          executablePath: chromeExecutablePath,
+        },
+      },
     },
 
     {

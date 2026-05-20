@@ -4,6 +4,10 @@ type VisualStatus = 'baseline' | 'clean' | 'changed' | 'accepted';
 type DashboardPage = 'projects' | 'dashboard' | 'snapshots';
 type VisualJob = 'visual-scan' | 'section-scan' | 'refresh-sections' | 'update-baselines';
 
+type VisualScanRunOptions = {
+  readonly retryWhenBusy?: boolean;
+};
+
 type VisualBaseline = {
   readonly id: string;
   readonly name: string;
@@ -94,6 +98,13 @@ type VisualScanResponse = {
   readonly manifest: VisualManifest;
 };
 
+type ScanProgress = {
+  readonly running: boolean;
+  readonly message: string;
+  readonly output: string;
+  readonly updatedAt?: string;
+};
+
 type SectionResponse = {
   readonly message: string;
   readonly section: VisualBaseline;
@@ -139,6 +150,7 @@ export class AppComponent implements OnInit, OnDestroy {
   readonly runningJob = signal<VisualJob | null>(null);
   readonly scanMessage = signal<string | null>(null);
   readonly scanError = signal<string | null>(null);
+  readonly scanProgress = signal<ScanProgress | null>(null);
   readonly cancelingScan = signal(false);
   readonly sectionFormOpen = signal(false);
   readonly editingSections = signal(false);
@@ -187,6 +199,7 @@ export class AppComponent implements OnInit, OnDestroy {
   readonly updatingGeneratedBaselines = computed(() => this.runningJob() === 'update-baselines');
 
   private scanAbortController: AbortController | null = null;
+  private scanProgressTimer: number | null = null;
 
   private readonly handlePopState = (): void => {
     this.currentPage.set(this.pageFromLocation());
@@ -212,6 +225,7 @@ export class AppComponent implements OnInit, OnDestroy {
 
   ngOnDestroy(): void {
     this.scanAbortController?.abort();
+    this.stopScanProgressPolling();
     window.removeEventListener('popstate', this.handlePopState);
   }
 
@@ -275,9 +289,10 @@ export class AppComponent implements OnInit, OnDestroy {
 
       await this.loadProjects();
       const project = payload as VisualProject;
-      this.projectMessage.set(`${project.name} created.`);
+      this.projectMessage.set(`${project.name} created. Starting scan.`);
       form.reset();
       await this.openProject(project.id);
+      await this.runVisualScan({ retryWhenBusy: true });
     } catch (error) {
       this.projectError.set(error instanceof Error ? error.message : 'Could not create this project.');
     } finally {
@@ -671,8 +686,13 @@ export class AppComponent implements OnInit, OnDestroy {
     }
   }
 
-  async runVisualScan(): Promise<void> {
-    await this.runVisualScanRequest(this.projectScopedUrl('/api/visual-scan'), false, 'visual-scan');
+  async runVisualScan(options: VisualScanRunOptions = {}): Promise<void> {
+    await this.runVisualScanRequest(
+      this.projectScopedUrl('/api/visual-scan'),
+      false,
+      'visual-scan',
+      options,
+    );
   }
 
   async runSelectedSectionScan(): Promise<void> {
@@ -680,7 +700,11 @@ export class AppComponent implements OnInit, OnDestroy {
     if (!baseline) {
       return;
     }
-    await this.runVisualScanRequest(this.projectScopedUrl(`/api/visual-sections/${encodeURIComponent(baseline.id)}/scan`), true, 'section-scan');
+    await this.runVisualScanRequest(
+      this.projectScopedUrl(`/api/visual-sections/${encodeURIComponent(baseline.id)}/scan`),
+      true,
+      'section-scan',
+    );
   }
 
   async refreshSections(): Promise<void> {
@@ -725,6 +749,12 @@ export class AppComponent implements OnInit, OnDestroy {
   }
 
   jobDescription(): string {
+    const progress = this.scanProgress();
+
+    if (progress?.message) {
+      return progress.message;
+    }
+
     const job = this.runningJob();
 
     if (this.cancelingScan()) {
@@ -740,7 +770,25 @@ export class AppComponent implements OnInit, OnDestroy {
     return 'Capturing current pages, checking pixels, and preparing the visual report.';
   }
 
-  private async runVisualScanRequest(endpoint: string, replaceSelectedSectionOnly = false, job: VisualJob = 'visual-scan'): Promise<void> {
+  scanProgressLines(): readonly string[] {
+    const output = this.scanProgress()?.output ?? '';
+    if (!output.trim()) {
+      return [];
+    }
+
+    return output
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .slice(-8);
+  }
+
+  private async runVisualScanRequest(
+    endpoint: string,
+    replaceSelectedSectionOnly = false,
+    job: VisualJob = 'visual-scan',
+    options: VisualScanRunOptions = {},
+  ): Promise<void> {
     if (this.scanning()) {
       return;
     }
@@ -752,38 +800,57 @@ export class AppComponent implements OnInit, OnDestroy {
     this.cancelingScan.set(false);
     this.scanMessage.set(null);
     this.scanError.set(null);
+    this.scanProgress.set(null);
     this.acceptMessage.set(null);
     this.acceptError.set(null);
     this.sectionMessage.set(null);
     this.sectionError.set(null);
+    this.startScanProgressPolling();
 
     try {
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        signal: controller.signal,
-      });
-      const payload = await response.json() as VisualScanResponse | { error?: string };
+      const maxAttempts = options.retryWhenBusy ? 30 : 1;
 
-      if (!response.ok) {
-        throw new Error('error' in payload && payload.error ? payload.error : 'Could not run the visual scan.');
-      }
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          signal: controller.signal,
+        });
+        const payload = await response.json() as VisualScanResponse | { error?: string };
+        const busy = response.status === 409
+          && 'error' in payload
+          && payload.error === 'A visual scan is already running.';
 
-      const scanPayload = payload as VisualScanResponse;
-      this.revisions.set(scanPayload.history.revisions);
-      this.revisionManifests.update((manifests) => ({
-        ...manifests,
-        [scanPayload.manifest.revisionId ?? scanPayload.history.latestRevisionId ?? 'latest']: scanPayload.manifest,
-      }));
-      this.selectedRevisionId.set(scanPayload.manifest.revisionId ?? scanPayload.history.latestRevisionId ?? '');
-      if (replaceSelectedSectionOnly && scanPayload.manifest.items.length === 1) {
-        this.replaceSection(scanPayload.manifest.items[0]);
-      } else {
-        this.applyManifest(scanPayload.manifest);
+        if (busy && options.retryWhenBusy && attempt < maxAttempts) {
+          this.scanMessage.set('Another visual scan is running. This project will scan next.');
+          await this.waitForRetry(3000, controller.signal);
+          continue;
+        }
+
+        if (!response.ok) {
+          const fallback = busy
+            ? 'Another visual scan is still running. Start this project scan when the current scan finishes.'
+            : 'Could not run the visual scan.';
+          throw new Error('error' in payload && payload.error && !busy ? payload.error : fallback);
+        }
+
+        const scanPayload = payload as VisualScanResponse;
+        this.revisions.set(scanPayload.history.revisions);
+        this.revisionManifests.update((manifests) => ({
+          ...manifests,
+          [scanPayload.manifest.revisionId ?? scanPayload.history.latestRevisionId ?? 'latest']: scanPayload.manifest,
+        }));
+        this.selectedRevisionId.set(scanPayload.manifest.revisionId ?? scanPayload.history.latestRevisionId ?? '');
+        if (replaceSelectedSectionOnly && scanPayload.manifest.items.length === 1) {
+          this.replaceSection(scanPayload.manifest.items[0]);
+        } else {
+          this.applyManifest(scanPayload.manifest);
+        }
+        await this.mergeAvailableSections();
+        this.scanMessage.set(scanPayload.message);
+        this.imageVersion.set(String(Date.now()));
+        await this.loadProjects();
+        return;
       }
-      await this.mergeAvailableSections();
-      this.scanMessage.set(scanPayload.message);
-      this.imageVersion.set(String(Date.now()));
-      await this.loadProjects();
     } catch (error) {
       if (this.isAbortError(error)) {
         this.scanMessage.set(job === 'section-scan' ? 'Section scan canceled.' : 'Visual scan canceled.');
@@ -794,10 +861,26 @@ export class AppComponent implements OnInit, OnDestroy {
       if (this.scanAbortController === controller) {
         this.scanAbortController = null;
       }
+      this.stopScanProgressPolling();
       this.cancelingScan.set(false);
       this.runningJob.set(null);
       this.scanning.set(false);
     }
+  }
+
+  private waitForRetry(milliseconds: number, signal: AbortSignal): Promise<void> {
+    return new Promise((resolve, reject) => {
+      if (signal.aborted) {
+        reject(new DOMException('Aborted', 'AbortError'));
+        return;
+      }
+
+      const timeout = window.setTimeout(resolve, milliseconds);
+      signal.addEventListener('abort', () => {
+        window.clearTimeout(timeout);
+        reject(new DOMException('Aborted', 'AbortError'));
+      }, { once: true });
+    });
   }
 
   private async runSectionRefreshRequest(update: boolean): Promise<void> {
@@ -807,7 +890,9 @@ export class AppComponent implements OnInit, OnDestroy {
 
     const controller = new AbortController();
     const job: VisualJob = update ? 'update-baselines' : 'refresh-sections';
-    const endpoint = this.projectScopedUrl('/api/visual-sections/crawl', update ? { update: 'true' } : undefined);
+    const endpoint = this.projectScopedUrl('/api/visual-sections/crawl', {
+      ...(update ? { update: 'true' } : {}),
+    });
 
     this.scanAbortController = controller;
     this.runningJob.set(job);
@@ -815,10 +900,12 @@ export class AppComponent implements OnInit, OnDestroy {
     this.cancelingScan.set(false);
     this.scanMessage.set(null);
     this.scanError.set(null);
+    this.scanProgress.set(null);
     this.acceptMessage.set(null);
     this.acceptError.set(null);
     this.sectionMessage.set(null);
     this.sectionError.set(null);
+    this.startScanProgressPolling();
 
     try {
       const response = await fetch(endpoint, {
@@ -847,6 +934,7 @@ export class AppComponent implements OnInit, OnDestroy {
       if (this.scanAbortController === controller) {
         this.scanAbortController = null;
       }
+      this.stopScanProgressPolling();
       this.cancelingScan.set(false);
       this.runningJob.set(null);
       this.scanning.set(false);
@@ -860,6 +948,36 @@ export class AppComponent implements OnInit, OnDestroy {
 
     this.cancelingScan.set(true);
     this.scanAbortController?.abort();
+  }
+
+  private startScanProgressPolling(): void {
+    this.stopScanProgressPolling();
+    void this.pollScanProgress();
+    this.scanProgressTimer = window.setInterval(() => {
+      void this.pollScanProgress();
+    }, 1000);
+  }
+
+  private stopScanProgressPolling(): void {
+    if (this.scanProgressTimer === null) {
+      return;
+    }
+
+    window.clearInterval(this.scanProgressTimer);
+    this.scanProgressTimer = null;
+  }
+
+  private async pollScanProgress(): Promise<void> {
+    try {
+      const response = await fetch('/api/visual-scan/status');
+      if (!response.ok) {
+        return;
+      }
+
+      this.scanProgress.set(await response.json() as ScanProgress);
+    } catch {
+      // Progress is secondary to the scan request itself.
+    }
   }
 
   async addSection(event: SubmitEvent): Promise<void> {
