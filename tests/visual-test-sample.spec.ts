@@ -1,9 +1,12 @@
 import { expect, test, type Page } from '@playwright/test';
 import { readFileSync } from 'node:fs';
+import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
 
 const projectId = process.env['VISUAL_PROJECT_ID'] ?? 'visual-test-sample';
 const manifestPath = path.join(__dirname, 'visual-projects', projectId, 'visual-pages.json');
+const progressDir = process.env['RATCHET_PROGRESS_DIR']
+  ?? path.join(process.cwd(), 'public', 'visual-results', projectId, 'progress');
 
 type VisualPage = {
   readonly id: string;
@@ -51,6 +54,7 @@ test.describe(projectId, () => {
   for (const visualPage of VISUAL_PAGES) {
     test(`matches the ${visualPage.name} visual baseline`, async ({ page }) => {
       await openVisualPageState(page, new URL(visualPage.url, TARGET_URL).toString(), visualPage.actions);
+      await captureProgressScreenshot(page, visualPage);
 
       await expect(page).toHaveScreenshot(visualPage.snapshotName, {
         fullPage: true,
@@ -62,6 +66,18 @@ test.describe(projectId, () => {
     });
   }
 });
+
+async function captureProgressScreenshot(page: Page, visualPage: VisualPage): Promise<void> {
+  await mkdir(progressDir, { recursive: true });
+
+  const fileName = `${visualPage.id}-current.png`;
+  await page.screenshot({
+    path: path.join(progressDir, fileName),
+    fullPage: true,
+    animations: 'disabled',
+    caret: 'hide',
+  });
+}
 
 async function openVisualPageState(page: Page, url: string, actions: readonly VisualAction[] = []): Promise<void> {
   await gotoWithRetry(page, url);

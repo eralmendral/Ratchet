@@ -771,6 +771,15 @@
   border-color: var(--status-accent);
 }
 
+.baseline-card.is-scanning {
+  background: #f3faf7;
+  border-color: #1f8a70;
+}
+
+.baseline-card.is-scanning small {
+  color: #1f6f5d;
+}
+
 .baseline-card.is-clean::after,
 .baseline-card.is-changed::after,
 .revision-card.is-clean::after,
@@ -1212,38 +1221,37 @@
 
 .scan-overlay {
   position: fixed;
-  inset: 0;
+  right: 24px;
+  bottom: 24px;
   z-index: 1000;
-  display: grid;
-  place-items: center;
-  padding: 24px;
-  background: rgba(246, 247, 249, 0.48);
-  backdrop-filter: blur(1.5px);
+  width: min(440px, calc(100vw - 48px));
+  pointer-events: none;
 }
 
-.scan-modal {
+.scan-status-panel {
   display: grid;
   gap: 18px;
-  width: min(560px, 100%);
+  width: 100%;
   padding: 22px;
   background: #ffffff;
   border: 1px solid #d9dee7;
   border-radius: 8px;
   box-shadow: 0 24px 70px rgba(17, 24, 39, 0.18);
+  pointer-events: auto;
 }
 
-.scan-modal h2,
-.scan-modal p {
+.scan-status-panel h2,
+.scan-status-panel p {
   margin: 0;
 }
 
-.scan-modal h2 {
+.scan-status-panel h2 {
   color: #111827;
   font-size: 1.35rem;
   line-height: 1.2;
 }
 
-.scan-modal p:not(.eyebrow) {
+.scan-status-panel p:not(.eyebrow) {
   margin-top: 8px;
   color: #526477;
   font-size: 0.95rem;
@@ -1373,6 +1381,12 @@
 
   .revision-list {
     grid-auto-columns: minmax(240px, 1fr);
+  }
+
+  .scan-overlay {
+    right: 16px;
+    bottom: 16px;
+    width: calc(100vw - 32px);
   }
 
   .preview-panel {

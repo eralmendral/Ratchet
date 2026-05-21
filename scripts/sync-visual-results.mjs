@@ -17,6 +17,7 @@ const testResultsDir = path.join(rootDir, 'test-results');
 const revisionRetention = 20;
 const currentScreenshotConcurrency = 4;
 const chromeExecutablePath = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+const scanPreviewOutputPrefix = '[ratchet-preview] ';
 
 function defaultVisualPage(project) {
   const baselineFileName = `home-page-chromium-${process.platform}.png`;
@@ -85,6 +86,21 @@ function pageDescription(status) {
   }
 
   return 'This screenshot is the original approved image used for future comparisons.';
+}
+
+function emitScanPreview(projectId, kind, visualPage, imageUrl) {
+  if (!visualPage?.id || !imageUrl) {
+    return;
+  }
+
+  console.log(`${scanPreviewOutputPrefix}${JSON.stringify({
+    id: visualPage.id,
+    projectId,
+    name: visualPage.name,
+    kind,
+    imageUrl,
+    capturedAt: new Date().toISOString(),
+  })}`);
 }
 
 async function fileExists(filePath) {
@@ -249,7 +265,7 @@ async function waitForPageReady(page) {
   }, null, { polling: 200, timeout: 3000 }).catch(() => null);
 }
 
-async function captureCleanPageArtifacts(items) {
+async function captureCleanPageArtifacts(items, projectId) {
   const pendingItems = items.filter((item) => item.status === 'clean' && !item.actualImageUrl);
 
   if (pendingItems.length === 0) {
@@ -263,6 +279,7 @@ async function captureCleanPageArtifacts(items) {
       try {
         await captureCurrentScreenshot(browser, item, path.join(rootDir, item.actualPath));
         item.actualImageUrl = item.pendingActualImageUrl;
+        emitScanPreview(projectId, 'current', item, `${item.actualImageUrl}?v=${Date.now()}`);
       } catch (error) {
         console.warn(`Could not capture current screenshot for ${item.name}:`, error.message);
         item.actualPath = null;
@@ -374,6 +391,7 @@ export async function syncVisualResults(options = {}) {
       item.diffImageUrl = diffImageUrl;
       item.actualPath = path.relative(rootDir, actualPath);
       item.diffPath = path.relative(rootDir, diffPath);
+      emitScanPreview(project.id, 'current', item, `${actualImageUrl}?v=${Date.now()}`);
 
       const errorContextPath = path.join(path.dirname(actual.path), 'error-context.md');
 
@@ -388,7 +406,7 @@ export async function syncVisualResults(options = {}) {
     items.push(item);
   }
 
-  await captureCleanPageArtifacts(items);
+  await captureCleanPageArtifacts(items, project.id);
 
   const changedPages = items.filter((item) => item.status === 'changed').length;
   const cleanPages = items.filter((item) => item.status === 'clean').length;

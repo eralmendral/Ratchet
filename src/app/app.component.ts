@@ -1,6 +1,6 @@
 import { Component, OnDestroy, OnInit, computed, signal } from '@angular/core';
 
-type VisualStatus = 'baseline' | 'clean' | 'changed' | 'accepted';
+type VisualStatus = 'baseline' | 'clean' | 'changed' | 'accepted' | 'scanning';
 type DashboardPage = 'projects' | 'dashboard' | 'snapshots';
 type VisualJob = 'visual-scan' | 'section-scan' | 'refresh-sections' | 'update-baselines';
 
@@ -27,6 +27,8 @@ type VisualBaseline = {
   readonly errorContextPath: string | null;
   readonly summary?: string;
   readonly description?: string;
+  readonly resultImageUrl?: string;
+  readonly resultKind?: string;
 };
 
 type VisualManifest = {
@@ -98,10 +100,20 @@ type VisualScanResponse = {
   readonly manifest: VisualManifest;
 };
 
+type ScanProgressPreview = {
+  readonly id: string;
+  readonly projectId?: string;
+  readonly name: string;
+  readonly kind: 'baseline' | 'current' | string;
+  readonly imageUrl: string;
+  readonly capturedAt: string;
+};
+
 type ScanProgress = {
   readonly running: boolean;
   readonly message: string;
   readonly output: string;
+  readonly previews?: readonly ScanProgressPreview[];
   readonly updatedAt?: string;
 };
 
@@ -437,6 +449,10 @@ export class AppComponent implements OnInit, OnDestroy {
   }
 
   statusLabel(status: VisualStatus): string {
+    if (status === 'scanning') {
+      return 'Scanning';
+    }
+
     if (status === 'accepted') {
       return 'Accepted as baseline';
     }
@@ -468,6 +484,10 @@ export class AppComponent implements OnInit, OnDestroy {
       return baseline.summary;
     }
 
+    if (baseline.status === 'scanning') {
+      return `${baseline.name} is being scanned.`;
+    }
+
     if (baseline.status === 'changed') {
       return `${baseline.name} changed from the approved baseline.`;
     }
@@ -482,6 +502,10 @@ export class AppComponent implements OnInit, OnDestroy {
   reportDescription(baseline: VisualBaseline): string {
     if (baseline.description) {
       return baseline.description;
+    }
+
+    if (baseline.status === 'scanning') {
+      return 'A screenshot result has been captured during the current visual scan. Final status will appear when comparison finishes.';
     }
 
     if (baseline.status === 'changed') {
@@ -524,9 +548,25 @@ export class AppComponent implements OnInit, OnDestroy {
   }
 
   cardDescription(baseline: VisualBaseline): string {
-    const pagePath = baseline.path ?? new URL(baseline.targetUrl).pathname;
+    let pagePath = baseline.path ?? '/';
+    if (!baseline.path && baseline.targetUrl) {
+      try {
+        pagePath = new URL(baseline.targetUrl).pathname;
+      } catch {
+        pagePath = '/';
+      }
+    }
     const pageReference = baseline.path === '/' || !baseline.path ? baseline.name : pagePath || '/';
+    if (baseline.status === 'scanning') {
+      const resultKind = baseline.resultKind === 'baseline' ? 'Baseline captured' : 'Result captured';
+      return `${pageReference} · ${resultKind}`;
+    }
+
     return `${pageReference} · ${this.statusLabel(baseline.status)}`;
+  }
+
+  cardImageUrl(baseline: VisualBaseline): string | null {
+    return baseline.resultImageUrl ?? baseline.baselineImageUrl;
   }
 
   revisionSummary(revision: VisualRevision): string {
@@ -970,13 +1010,22 @@ export class AppComponent implements OnInit, OnDestroy {
   private async pollScanProgress(): Promise<void> {
     try {
       const response = await fetch('/api/visual-scan/status');
-      if (!response.ok) {
-        return;
+      if (response.ok) {
+        const progress = await response.json() as ScanProgress;
+        this.scanProgress.set(progress);
+        this.applyScanProgressPreviews(progress.previews ?? []);
       }
-
-      this.scanProgress.set(await response.json() as ScanProgress);
     } catch {
       // Progress is secondary to the scan request itself.
+    }
+
+    try {
+      const changed = await this.mergeAvailableSections();
+      if (changed) {
+        this.imageVersion.set(String(Date.now()));
+      }
+    } catch {
+      // Section polling is best effort while the long-running job owns the final response.
     }
   }
 
@@ -1209,6 +1258,103 @@ export class AppComponent implements OnInit, OnDestroy {
     this.selectedBaselineId.set(nextSelectedBaseline);
   }
 
+  private applyScanProgressPreviews(previews: readonly ScanProgressPreview[]): void {
+    if (!previews.length) {
+      return;
+    }
+
+    const selectedProjectId = this.selectedProjectId();
+    const relevantPreviews = previews.filter((preview) => {
+      return (!preview.projectId || preview.projectId === selectedProjectId)
+        && Boolean(preview.id && preview.imageUrl);
+    });
+
+    if (!relevantPreviews.length) {
+      return;
+    }
+
+    let changed = false;
+    this.baselines.update((baselines) => {
+      let nextBaselines = baselines;
+
+      for (const preview of relevantPreviews) {
+        const existingIndex = nextBaselines.findIndex((baseline) => baseline.id === preview.id);
+        if (existingIndex >= 0) {
+          const existing = nextBaselines[existingIndex];
+          const updated = this.baselineWithScanPreview(existing, preview);
+          if (this.scanPreviewChanged(existing, updated)) {
+            nextBaselines = nextBaselines.map((baseline, index) => index === existingIndex ? updated : baseline);
+            changed = true;
+          }
+          continue;
+        }
+
+        nextBaselines = [...nextBaselines, this.baselineFromScanPreview(preview)];
+        changed = true;
+      }
+
+      return nextBaselines;
+    });
+
+    if (changed) {
+      if (!this.selectedBaselineId()) {
+        this.selectedBaselineId.set(this.baselines()[0]?.id ?? '');
+      }
+      this.imageVersion.set(String(Date.now()));
+    }
+  }
+
+  private baselineWithScanPreview(baseline: VisualBaseline, preview: ScanProgressPreview): VisualBaseline {
+    return {
+      ...baseline,
+      name: preview.name || baseline.name,
+      status: 'scanning',
+      generatedAt: preview.capturedAt || baseline.generatedAt,
+      actualImageUrl: preview.kind === 'current' ? preview.imageUrl : baseline.actualImageUrl,
+      resultImageUrl: preview.imageUrl,
+      resultKind: preview.kind,
+      summary: `${preview.name || baseline.name} is being scanned.`,
+      description: 'A screenshot result has been captured during the current visual scan. Final status will appear when comparison finishes.',
+    };
+  }
+
+  private baselineFromScanPreview(preview: ScanProgressPreview): VisualBaseline {
+    const selectedProject = this.selectedProject();
+    const targetUrl = selectedProject?.targetUrl ?? '';
+    const source = selectedProject?.name ?? 'Visual Project';
+
+    return {
+      id: preview.id,
+      name: preview.name || preview.id,
+      source,
+      targetUrl,
+      browser: 'Chromium',
+      viewport: '1440 x 900',
+      status: 'scanning',
+      generatedAt: preview.capturedAt || null,
+      baselineImageUrl: preview.imageUrl,
+      actualImageUrl: preview.kind === 'current' ? preview.imageUrl : null,
+      diffImageUrl: null,
+      snapshotPath: '',
+      actualPath: null,
+      diffPath: null,
+      errorContextPath: null,
+      summary: `${preview.name || preview.id} is being scanned.`,
+      description: 'A screenshot result has been captured during the current visual scan. Final status will appear when comparison finishes.',
+      resultImageUrl: preview.imageUrl,
+      resultKind: preview.kind,
+    };
+  }
+
+  private scanPreviewChanged(before: VisualBaseline, after: VisualBaseline): boolean {
+    return before.name !== after.name
+      || before.status !== after.status
+      || before.generatedAt !== after.generatedAt
+      || before.actualImageUrl !== after.actualImageUrl
+      || before.resultImageUrl !== after.resultImageUrl
+      || before.resultKind !== after.resultKind;
+  }
+
   private applyAcceptResponse(payload: AcceptRevisionResponse, fallbackRevisionId: string): void {
     this.revisions.set(payload.history.revisions);
     this.revisionManifests.update((manifests) => ({
@@ -1221,17 +1367,25 @@ export class AppComponent implements OnInit, OnDestroy {
     void this.loadProjects();
   }
 
-  private async mergeAvailableSections(): Promise<void> {
+  private async mergeAvailableSections(): Promise<boolean> {
     const manifest = await this.fetchJson<VisualManifest>(this.projectScopedUrl('/api/visual-sections')).catch(() => null);
     if (!manifest?.items.length) {
-      return;
+      return false;
     }
 
+    let changed = false;
     this.baselines.update((baselines) => {
       const existingIds = new Set(baselines.map((baseline) => baseline.id));
       const missingSections = manifest.items.filter((section) => !existingIds.has(section.id));
+      changed = missingSections.length > 0;
       return missingSections.length ? [...baselines, ...missingSections] : baselines;
     });
+
+    if (changed && !this.selectedBaselineId()) {
+      this.selectedBaselineId.set(this.baselines()[0]?.id ?? '');
+    }
+
+    return changed;
   }
 
   private mergeSection(section: VisualBaseline): void {

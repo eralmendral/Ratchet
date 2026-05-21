@@ -189,11 +189,21 @@ type scanResponse struct {
 	Manifest revisionManifest `json:"manifest"`
 }
 
+type scanPreview struct {
+	ID         string `json:"id"`
+	ProjectID  string `json:"projectId,omitempty"`
+	Name       string `json:"name"`
+	Kind       string `json:"kind"`
+	ImageURL   string `json:"imageUrl"`
+	CapturedAt string `json:"capturedAt"`
+}
+
 type scanStatusResponse struct {
-	Running   bool   `json:"running"`
-	Message   string `json:"message"`
-	Output    string `json:"output"`
-	UpdatedAt string `json:"updatedAt,omitempty"`
+	Running   bool          `json:"running"`
+	Message   string        `json:"message"`
+	Output    string        `json:"output"`
+	Previews  []scanPreview `json:"previews"`
+	UpdatedAt string        `json:"updatedAt,omitempty"`
 }
 
 type sectionResponse struct {
@@ -656,6 +666,8 @@ func (s server) handleStatic(w http.ResponseWriter, r *http.Request) {
 
 var errScanAlreadyRunning = errors.New("A visual scan is already running.")
 
+const scanPreviewOutputPrefix = "[ratchet-preview] "
+
 func (s *server) runVisualScan(ctx context.Context, project projectContext, sectionID string) (scanResponse, error) {
 	if err := s.beginVisualJob(fmt.Sprintf("Starting visual scan for %s.", project.Project.Name)); err != nil {
 		return scanResponse{}, err
@@ -769,6 +781,7 @@ func (s *server) beginVisualJob(message string) error {
 		Running:   true,
 		Message:   message,
 		Output:    "",
+		Previews:  []scanPreview{},
 		UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
 	}
 	return nil
@@ -786,12 +799,23 @@ func (s *server) visualJobStatus() scanStatusResponse {
 	s.scanMu.Lock()
 	defer s.scanMu.Unlock()
 
-	return s.scanStatus
+	status := s.scanStatus
+	status.Previews = append([]scanPreview(nil), s.scanStatus.Previews...)
+	return status
 }
 
 func (s *server) appendVisualJobOutput(line string) {
 	cleanLine := strings.TrimSpace(stripTerminalControls(line))
 	if cleanLine == "" {
+		return
+	}
+
+	if strings.HasPrefix(cleanLine, scanPreviewOutputPrefix) {
+		var preview scanPreview
+		payload := strings.TrimPrefix(cleanLine, scanPreviewOutputPrefix)
+		if err := json.Unmarshal([]byte(payload), &preview); err == nil {
+			s.appendVisualJobPreview(preview)
+		}
 		return
 	}
 
@@ -812,6 +836,50 @@ func (s *server) appendVisualJobOutput(line string) {
 	}
 
 	s.scanStatus.Message = cleanLine
+	s.scanStatus.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+}
+
+func (s *server) appendVisualJobPreview(preview scanPreview) {
+	if preview.ID == "" || preview.ImageURL == "" {
+		return
+	}
+	if preview.Kind == "" {
+		preview.Kind = "current"
+	}
+	if preview.CapturedAt == "" {
+		preview.CapturedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+
+	s.scanMu.Lock()
+	defer s.scanMu.Unlock()
+
+	replaceIndex := -1
+	for index, existing := range s.scanStatus.Previews {
+		if existing.ProjectID == preview.ProjectID && existing.ID == preview.ID && existing.Kind == preview.Kind {
+			replaceIndex = index
+			break
+		}
+	}
+
+	if replaceIndex >= 0 {
+		s.scanStatus.Previews[replaceIndex] = preview
+	} else {
+		const maxPreviewItems = 80
+		s.scanStatus.Previews = append(s.scanStatus.Previews, preview)
+		if len(s.scanStatus.Previews) > maxPreviewItems {
+			s.scanStatus.Previews = s.scanStatus.Previews[len(s.scanStatus.Previews)-maxPreviewItems:]
+		}
+	}
+
+	kind := strings.TrimSpace(preview.Kind)
+	if kind == "" {
+		kind = "screenshot"
+	}
+	name := strings.TrimSpace(preview.Name)
+	if name == "" {
+		name = preview.ID
+	}
+	s.scanStatus.Message = fmt.Sprintf("Captured %s result: %s", kind, name)
 	s.scanStatus.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
 }
 

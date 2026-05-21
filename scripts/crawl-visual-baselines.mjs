@@ -15,6 +15,7 @@ const defaultCaptureConcurrency = 6;
 const chromeExecutablePath = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const browserName = 'chromium';
 const platformName = process.platform;
+const scanPreviewOutputPrefix = '[ratchet-preview] ';
 const componentClassPrefixes = ['tile', 'card', 'tab', 'grid', 'modal'];
 const componentClassSelectors = componentClassPrefixes.flatMap((prefix) => [
   `[class~="${prefix}" i]`,
@@ -146,6 +147,21 @@ function withVisualPageId(projectId, visualPage, id) {
   };
 }
 
+function emitScanPreview(projectId, kind, visualPage, imageUrl) {
+  if (!visualPage?.id || !imageUrl) {
+    return;
+  }
+
+  console.log(`${scanPreviewOutputPrefix}${JSON.stringify({
+    id: visualPage.id,
+    projectId,
+    name: visualPage.name,
+    kind,
+    imageUrl,
+    capturedAt: new Date().toISOString(),
+  })}`);
+}
+
 function canonicalizeUrl(url) {
   const parsedUrl = new URL(url);
 
@@ -185,6 +201,10 @@ async function readExistingManifest(manifestPath) {
   } catch {
     return null;
   }
+}
+
+async function writeVisualManifest(manifestPath, manifest) {
+  await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 }
 
 async function collectPageName(page, url) {
@@ -437,7 +457,7 @@ async function collectClickActions(page, origin) {
   }, interactiveSelector);
 }
 
-async function discoverPages(page, targetUrl, maxPages, projectId, maxActionDepth = defaultMaxActionDepth) {
+async function discoverPages(page, targetUrl, maxPages, projectId, maxActionDepth = defaultMaxActionDepth, onDiscovered = null) {
   const rootUrl = canonicalizeUrl(targetUrl);
   const origin = new URL(rootUrl).origin;
   const queue = [{ url: rootUrl, actions: [] }];
@@ -470,6 +490,7 @@ async function discoverPages(page, targetUrl, maxPages, projectId, maxActionDept
       url: currentUrl,
       ...(currentActions.length ? { actions: currentActions } : {}),
     }, slug));
+    await onDiscovered?.(discoveredPages);
 
     for (const normalizedUrl of await collectInternalLinks(page, origin)) {
       const nextState = { url: normalizedUrl, actions: [] };
@@ -517,6 +538,20 @@ async function discoverPages(page, targetUrl, maxPages, projectId, maxActionDept
   return discoveredPages;
 }
 
+function reconcileManifestPages(projectId, discoveredPages, manualPages, fallbackPages) {
+  const reservedIds = new Set(manualPages.map((visualPage) => visualPage.id));
+  const reconciledDiscoveredPages = discoveredPages.map((visualPage) => {
+    const pageId = uniqueVisualPageId(visualPage.id, reservedIds);
+    reservedIds.add(pageId);
+
+    return pageId === visualPage.id ? visualPage : withVisualPageId(projectId, visualPage, pageId);
+  });
+
+  return discoveredPages.length > 0
+    ? [...reconciledDiscoveredPages, ...manualPages]
+    : fallbackPages;
+}
+
 async function runWithConcurrency(items, concurrency, worker) {
   let nextIndex = 0;
   const workerCount = Math.max(1, Math.min(concurrency, items.length));
@@ -535,7 +570,7 @@ async function runWithConcurrency(items, concurrency, worker) {
   }));
 }
 
-async function captureBaselines(browser, pages, update, snapshotDir, concurrency) {
+async function captureBaselines(browser, pages, update, snapshotDir, concurrency, projectId) {
   await mkdir(snapshotDir, { recursive: true });
   const captures = [];
 
@@ -573,6 +608,7 @@ async function captureBaselines(browser, pages, update, snapshotDir, concurrency
         animations: 'disabled',
         caret: 'hide',
       });
+      emitScanPreview(projectId, 'baseline', visualPage, `${visualPage.baselineImageUrl}?v=${Date.now()}`);
     } finally {
       await page.close();
     }
@@ -610,33 +646,50 @@ export async function crawlVisualBaselines(options = {}) {
         throw new Error(`Unknown visual section: ${sectionId}`);
       }
 
-      await captureBaselines(browser, sectionPages, update, paths.snapshotDir, captureConcurrency);
+      await captureBaselines(browser, sectionPages, update, paths.snapshotDir, captureConcurrency, project.id);
       return existingManifest;
     }
 
     if (!discover && existingPages.length > 0) {
       console.log(`[ratchet] Reusing ${existingPages.length} registered section(s). Run Refresh Sections to discover new routes or components.`);
-      await captureBaselines(browser, existingPages, update, paths.snapshotDir, captureConcurrency);
+      await captureBaselines(browser, existingPages, update, paths.snapshotDir, captureConcurrency, project.id);
       return existingManifest;
     }
 
-    const discoveredPages = await discoverPages(page, targetUrl, maxPages, project.id, maxActionDepth);
-    console.log(`[ratchet] Discovery complete: ${discoveredPages.length} section(s).`);
     const manualPages = Array.isArray(existingManifest?.pages)
       ? existingManifest.pages.filter((manifestPage) => manifestPage.manualBaseline)
       : [];
-    const reservedIds = new Set(manualPages.map((visualPage) => visualPage.id));
-    const reconciledDiscoveredPages = discoveredPages.map((visualPage) => {
-      const pageId = uniqueVisualPageId(visualPage.id, reservedIds);
-      reservedIds.add(pageId);
+    const writeDiscoveredManifest = async (discoveredPagesSoFar) => {
+      const manifestPagesSoFar = reconcileManifestPages(
+        project.id,
+        discoveredPagesSoFar,
+        manualPages,
+        existingManifest?.pages ?? [],
+      );
 
-      return pageId === visualPage.id ? visualPage : withVisualPageId(project.id, visualPage, pageId);
-    });
-    const manifestPages = discoveredPages.length > 0
-      ? [...reconciledDiscoveredPages, ...manualPages]
-      : existingManifest?.pages ?? [];
+      await writeVisualManifest(paths.visualPagesPath, {
+        version: 1,
+        targetUrl,
+        generatedAt: new Date().toISOString(),
+        pages: manifestPagesSoFar,
+      });
+    };
 
-    await captureBaselines(browser, manifestPages, update, paths.snapshotDir, captureConcurrency);
+    const discoveredPages = await discoverPages(
+      page,
+      targetUrl,
+      maxPages,
+      project.id,
+      maxActionDepth,
+      writeDiscoveredManifest,
+    );
+    console.log(`[ratchet] Discovery complete: ${discoveredPages.length} section(s).`);
+    const manifestPages = reconcileManifestPages(
+      project.id,
+      discoveredPages,
+      manualPages,
+      existingManifest?.pages ?? [],
+    );
 
     const manifest = {
       version: 1,
@@ -645,7 +698,12 @@ export async function crawlVisualBaselines(options = {}) {
       pages: manifestPages,
     };
 
-    await writeFile(paths.visualPagesPath, `${JSON.stringify(manifest, null, 2)}\n`);
+    await writeVisualManifest(paths.visualPagesPath, manifest);
+    console.log(`[ratchet] Registered ${manifestPages.length} section(s). Capturing baselines next.`);
+
+    await captureBaselines(browser, manifestPages, update, paths.snapshotDir, captureConcurrency, project.id);
+
+    await writeVisualManifest(paths.visualPagesPath, manifest);
     return manifest;
   } finally {
     await browser.close();

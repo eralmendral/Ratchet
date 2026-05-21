@@ -63,7 +63,7 @@
   </main>
 } @else {
 <main class="dashboard-shell" [attr.aria-busy]="scanning()">
-  <aside class="baseline-rail" aria-label="Original screenshot baselines" [attr.inert]="scanning() ? '' : null">
+  <aside class="baseline-rail" aria-label="Visual sections and scan results">
     <div class="rail-header">
       <p class="eyebrow">Sections</p>
     </div>
@@ -89,9 +89,10 @@
             [class.is-selected]="baseline.id === selectedBaseline()?.id"
             [class.is-clean]="baseline.status === 'clean'"
             [class.is-changed]="baseline.status === 'changed'"
+            [class.is-scanning]="baseline.status === 'scanning'"
             (click)="selectBaseline(baseline.id)"
           >
-            <img [src]="imageSrc(baseline.baselineImageUrl)" [alt]="baseline.source + ' ' + baseline.name + ' baseline screenshot'">
+            <img [src]="imageSrc(cardImageUrl(baseline))" [alt]="baseline.source + ' ' + baseline.name + ' screenshot result'">
             <span>
               <strong>{{ cardTitle(baseline) }}</strong>
               <small>{{ cardDescription(baseline) }}</small>
@@ -354,8 +355,8 @@
   </section>
 
   @if (scanning()) {
-    <section class="scan-overlay" role="alertdialog" aria-modal="true" aria-labelledby="scan-overlay-title">
-      <div class="scan-modal">
+    <section class="scan-overlay" aria-live="polite" aria-labelledby="scan-overlay-title">
+      <div class="scan-status-panel">
         <div>
           <p class="eyebrow">{{ jobEyebrow() }}</p>
           <h2 id="scan-overlay-title">{{ jobTitle() }}</h2>
